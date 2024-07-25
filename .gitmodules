@@ -47,7 +47,8 @@
 	branch = prod
 [submodule "firmware/libfirmware"]
 	path = firmware/libfirmware
-	url = https://github.com/rusefi/libfirmware.git
+	url = https://github.com/tobsec/libfirmware.git
+	branch = NMEA2000
 [submodule "firmware/controllers/can/NMEA2000"]
 	path = firmware/controllers/can/NMEA2000
 	url = https://github.com/tobsec/NMEA2000
