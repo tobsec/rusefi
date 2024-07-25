@@ -25,6 +25,7 @@ rm -f $ZIP $IMAGE
 # copy *FS_SIZE*KB of zeroes
 dd if=/dev/zero of=$IMAGE bs=1024 count=$FS_SIZE
 
+exit 0
 # create a FAT filesystem inside, name it RUSEFI
 mkfs.fat -v -r 64 $IMAGE
 # labels can be no longer than 11 characters

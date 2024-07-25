@@ -131,7 +131,9 @@ static const CANConfig canConfig500;
 static const CANConfig canConfig1000;
 #endif
 
-class CanRead final : protected ThreadController<UTILITY_THREAD_STACK_SIZE> {
+#define CAN_THREAD_STACK_SIZE (1 * UTILITY_THREAD_STACK_SIZE)
+
+class CanRead final : protected ThreadController<CAN_THREAD_STACK_SIZE> {
 public:
 	CanRead(size_t index)
 		: ThreadController("CAN RX", PRIO_CAN_RX)

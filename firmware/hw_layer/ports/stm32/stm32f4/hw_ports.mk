@@ -12,6 +12,7 @@ ALLCSRC += $(CHIBIOS)/os/hal/boards/ST_STM32F4_DISCOVERY/board.c
 CONFDIR = $(PROJECT_DIR)/hw_layer/ports/stm32/stm32f4/cfg
 
 # STM32F42x has extra memory, so change some flags so we can use it.
+# TODO: What about 427 ???
 ifeq ($(IS_STM32F429),yes)
 	USE_OPT += -Wl,--defsym=STM32F4_HAS_SRAM3=1
 	DDEFS += -DSTM32F429xx

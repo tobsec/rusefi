@@ -265,6 +265,8 @@ case CAN_BUS_NISSAN_VQ:
   return "CAN_BUS_NISSAN_VQ";
 case CAN_BUS_W202_C180:
   return "CAN_BUS_W202_C180";
+case CAN_BUS_NBC_NMEA2K:
+  return "CAN_BUS_NBC_NMEA2K";
   }
  return NULL;
 }

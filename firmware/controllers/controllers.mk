@@ -55,6 +55,18 @@ CONTROLLERS_SRC_CPP = \
 	$(CONTROLLERS_DIR)/can/can_tx.cpp \
 	$(CONTROLLERS_DIR)/can/can_dash.cpp \
 	$(CONTROLLERS_DIR)/can/can_vss.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/ActisenseReader.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/N2kDeviceList.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/N2kGroupFunction.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/N2kGroupFunctionDefaultHandlers.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/N2kMaretron.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/N2kMessages.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/N2kMsg.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/N2kStream.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/N2kTimer.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/NMEA2000.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src/Seasmart.cpp \
+	$(CONTROLLERS_DIR)/can/NMEA2000_rusefi/NMEA2000_rusefi.cpp \
  	$(CONTROLLERS_DIR)/engine_controller.cpp \
  	$(CONTROLLERS_DIR)/engine_controller_misc.cpp \
 	$(CONTROLLERS_DIR)/persistent_store.cpp \
@@ -84,6 +96,8 @@ CONTROLLERS_INC=\
     $(CONTROLLERS_DIR)/sensors \
 	$(CONTROLLERS_DIR)/sensors/converters \
 	$(CONTROLLERS_DIR)/can \
+	$(CONTROLLERS_DIR)/can/NMEA2000/src \
+	$(CONTROLLERS_DIR)/can/NMEA2000_rusefi \
 	$(CONTROLLERS_DIR)/core \
 	$(CONTROLLERS_DIR)/gauges \
 	$(CONTROLLERS_DIR)/math \

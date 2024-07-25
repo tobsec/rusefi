@@ -48,3 +48,11 @@
 [submodule "firmware/libfirmware"]
 	path = firmware/libfirmware
 	url = https://github.com/rusefi/libfirmware.git
+[submodule "firmware/controllers/can/NMEA2000"]
+	path = firmware/controllers/can/NMEA2000
+	url = https://github.com/tobsec/NMEA2000
+	branch = rusefi
+[submodule "firmware/controllers/can/NMEA2000_rusefi"]
+	path = firmware/controllers/can/NMEA2000_rusefi
+	url = https://github.com/tobsec/NMEA2000_rusefi
+	branch = rusefi

@@ -325,7 +325,7 @@ CPPC = $(CCPREFIX) $(TRGT)g++
 # NOTE: You can use C++ even without C++ support if you are careful. C++
 #       runtime support makes code size explode.
 LD   = $(CC)
-#LD   = $(CPPC)
+# LD   = $(CPPC)
 CP   = $(TRGT)objcopy
 AS   = $(CC) -x assembler-with-cpp
 AR   = $(TRGT)ar

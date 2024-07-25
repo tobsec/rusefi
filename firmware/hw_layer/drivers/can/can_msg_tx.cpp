@@ -75,8 +75,12 @@ CanTxMessage::~CanTxMessage() {
 				m_frame.data8[6], m_frame.data8[7]);
 	}
 
+	osalDbgAssert((&m_frame != nullptr), "m_frame is null");
+
+	// if (device == s_devices[1]) __asm volatile("BKPT #0\n");
+
 	// 100 ms timeout
-	msg_t msg = canTransmit(device, CAN_ANY_MAILBOX, &m_frame, TIME_MS2I(100));
+	msg_t msg = canTransmitTimeout(device, CAN_ANY_MAILBOX, &m_frame, TIME_MS2I(10)); // rename for debugger -- give only 10ms timeout
 #if EFI_TUNER_STUDIO
 	if (msg == MSG_OK) {
 		engine->outputChannels.canWriteOk++;

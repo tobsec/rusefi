@@ -9,11 +9,32 @@
 
 #include "pch.h"
 
-#if EFI_CAN_SUPPORT
+// #if EFI_CAN_SUPPORT
 #include "can_dash.h"
 #include "can_msg_tx.h"
 #include "can_bmw.h"
 #include "can_vag.h"
+
+#include "malfunction_central.h"
+
+// ----------------------------------NMEA2000----------------------------------------
+#define USE_N2K_CAN USE_N2K_ESP32_CAN
+#include <NMEA2000_CAN.h>  // This will automatically choose right CAN library and create suitable NMEA2000 object
+#include <N2kMessages.h>
+
+// List here messages your device will transmit.
+const unsigned long TransmitMessages[] PROGMEM={130310L,130311L,130312L,0};
+
+// Define schedulers for messages. Define schedulers here disabled. Schedulers will be enabled
+// on OnN2kOpen so they will be synchronized with system.
+// We use own scheduler for each message so that each can have different offset and period.
+// Setup periods according PGN definition (see comments on IsDefaultSingleFrameMessage and
+// IsDefaultFastPacketMessage) and message first start offsets. Use a bit different offset for
+// each message so they will not be sent at same time.
+// tN2kSyncScheduler TemperatureScheduler(false,2000,500);
+// tN2kSyncScheduler EnvironmentalScheduler(false,500,510);
+// tN2kSyncScheduler OutsideEnvironmentalScheduler(false,500,520);
+// ----------------------------------------------------------------------------------
 
 #include "rusefi_types.h"
 #include "rtc_helper.h"
@@ -129,6 +150,7 @@ void canDashboardNissanVQ(CanCycle cycle);
 void canDashboardGenesisCoupe(CanCycle cycle);
 void canDashboardAim(CanCycle cycle);
 void canDashboardHaltech(CanCycle cycle);
+void canDashboardNMEA2000(CanCycle cycle);
 
 void updateDash(CanCycle cycle) {
 
@@ -168,6 +190,9 @@ void updateDash(CanCycle cycle) {
 		break;
 	case CAN_AIM_DASH:
 		canDashboardAim(cycle);
+		break;
+	case CAN_BUS_NBC_NMEA2K:
+		canDashboardNMEA2000(cycle);
 		break;
 	default:
 		firmwareError(OBD_PCM_Processor_Fault, "Nothing for canNbcType %s", getCan_nbc_e(engineConfiguration->canNbcType));
@@ -1311,4 +1336,369 @@ void canDashboardAim(CanCycle cycle) {
 	// transmitStruct<Aim5fd>(0x5fd, false);
 }
 
-#endif // EFI_CAN_SUPPORT
+// *****************************************************************************
+// Call back for NMEA2000 open. This will be called, when library starts bus communication.
+// See NMEA2000.SetOnOpen(OnN2kOpen); on setup()
+void OnN2kOpen() {
+  // Start schedulers now.
+//   TemperatureScheduler.UpdateNextTime();
+//   EnvironmentalScheduler.UpdateNextTime();
+//   OutsideEnvironmentalScheduler.UpdateNextTime();
+}
+
+// double ReadCabinTemp()
+// {
+// 	static double temp = 21.0;
+// 	return temp += 0.01;
+// }
+
+// double ReadWaterTemp()
+// {
+// 	static double temp = 11.0;
+// 	return temp += 0.01;
+// }
+	// static volatile uint16_t cntTemperatureScheduler = 0u;
+	// static volatile uint16_t cntEnvironmentalScheduler = 0u;
+	// static volatile uint16_t cntOutsideEnvironmentalScheduler = 0u;
+
+//NMEA2000 Dashboard
+void canDashboardNMEA2000(CanCycle cycle) {
+
+	static bool initDone = false;
+
+	static bool doOnce = false;
+
+	if (false == initDone)
+	{
+		// Set Product information
+		NMEA2000.SetProductInformation("00000001", // Manufacturer's Model serial code
+										100, // Manufacturer's product code
+										"rusEFI Eidothea",  // Manufacturer's Model ID
+										"1.1.0.0 (2024-07-10)",  // Manufacturer's Software version code
+										"1.0.0.0 (2023-04-01)" // Manufacturer's Model version
+										);
+		// Set device information
+		NMEA2000.SetDeviceInformation(112233, // Unique number. Use e.g. Serial number.
+										140, // Device function=Engine. See codes on https://web.archive.org/web/20190531120557/https://www.nmea.org/Assets/20120726%20nmea%202000%20class%20&%20function%20codes%20v%202.00.pdf
+										50, // Device class=Propulsion. See codes on https://web.archive.org/web/20190531120557/https://www.nmea.org/Assets/20120726%20nmea%202000%20class%20&%20function%20codes%20v%202.00.pdf
+										2040 // Just choosen free from code list on https://web.archive.org/web/20190529161431/http://www.nmea.org/Assets/20121020%20nmea%202000%20registration%20list.pdf
+									);
+		// Uncomment 2 rows below to see, what device will send to bus. Use e.g. OpenSkipper or Actisense NMEA Reader                           
+		//Serial.begin(115200);
+		//NMEA2000.SetForwardStream(&Serial);
+		// If you want to use simple ascii monitor like Arduino Serial Monitor, uncomment next line
+		//NMEA2000.SetForwardType(tNMEA2000::fwdt_Text); // Show in clear text. Leave uncommented for default Actisense format.
+
+		// If you also want to see all traffic on the bus use N2km_ListenAndNode instead of N2km_NodeOnly below
+		NMEA2000.SetMode(tNMEA2000::N2km_NodeOnly,22);
+		//NMEA2000.SetDebugMode(tNMEA2000::dm_Actisense); // Uncomment this, so you can test code without CAN bus chips on Arduino Mega
+		NMEA2000.EnableForward(false); // Disable all msg forwarding to USB (=Serial)
+		// Here we tell library, which PGNs we transmit
+		NMEA2000.ExtendTransmitMessages(TransmitMessages);
+		// Define OnOpen call back. This will be called, when CAN is open and system starts address claiming.
+		NMEA2000.SetOnOpen(OnN2kOpen);
+		NMEA2000.Open();
+
+		initDone = true;
+	}
+
+	// warning(CUSTOM_ERR_CAN_CONFIGURATION, "canDashboardNMEA2000");
+
+	tN2kMsg N2kMsg;
+
+	// if (TemperatureScheduler.IsTime())
+	// {
+	// 	TemperatureScheduler.UpdateNextTime();
+	// 	SetN2kTemperature(N2kMsg, 1, 1, N2kts_MainCabinTemperature, CToKelvin(ReadCabinTemp()));
+	// 	NMEA2000.SendMsg(N2kMsg);
+	// 	cntTemperatureScheduler++;
+	// }
+
+	// if (EnvironmentalScheduler.IsTime())
+	// {
+	// 	EnvironmentalScheduler.UpdateNextTime();
+	// 	// SetN2kEnvironmentalParameters(N2kMsg, 1, N2kts_MainCabinTemperature, ReadCabinTemp());
+	// 	SetN2kEnvironmentalParameters(N2kMsg, 1, N2kts_OutsideTemperature, CToKelvin(ReadCabinTemp()));
+
+	// 	NMEA2000.SendMsg(N2kMsg);
+	// 	cntEnvironmentalScheduler++;
+	// }
+
+	// if (OutsideEnvironmentalScheduler.IsTime())
+	// {
+	// 	OutsideEnvironmentalScheduler.UpdateNextTime();
+	// 	// SetN2kOutsideEnvironmentalParameters(N2kMsg, 1, ReadWaterTemp(), CToKelvin(ReadCabinTemp()+10.0), 850.0 );
+	// 	SetN2kOutsideEnvironmentalParameters(N2kMsg, 1, N2kDoubleNA, N2kDoubleNA, 850.0 );
+	// 	NMEA2000.SendMsg(N2kMsg);
+	// 	cntOutsideEnvironmentalScheduler++;
+	// 	// Serial.print(millis()); Serial.println(", Temperature send ready");
+	// }
+
+	if (cycle.isInterval(CI::_100ms))
+	{
+		SetN2kPGN127488(N2kMsg, 0 /* EngineInstance */, Sensor::getOrZero(SensorType::Rpm) /* EngineSpeed */,
+                     Sensor::getOrZero(SensorType::Map) /* EngineBoostPressure */);
+		NMEA2000.SendMsg(N2kMsg);
+
+		/* Lambda */
+		uint16_t lambdaVal[2u] = {
+			(uint16_t)(Sensor::getOrZero(SensorType::Lambda1)/0.0001),
+			(uint16_t)(Sensor::getOrZero(SensorType::Lambda2)/0.0001) };
+		double outputLambda = 0.0;
+
+		{
+			CanTxMessage msg(CanCategory::NBC, 0x180);
+			msg.busIndex = 1;
+			msg[0] = (uint8_t)(lambdaVal[0u] >> 8);
+			msg[1] = (uint8_t)(lambdaVal[0u] & 0xFF);
+		}
+
+		{
+			CanTxMessage msg(CanCategory::NBC, 0x181);
+			msg.busIndex = 1;
+			msg[0] = (uint8_t)(lambdaVal[1u] >> 8);
+			msg[1] = (uint8_t)(lambdaVal[1u] & 0xFF);
+		}
+
+		/* Use outside Atmospheric Pressure as Lambda */
+   		// Check all sensors for invalid value or timeout
+		for (uint8_t i=0u; i<2u; i++)
+		{
+			if (lambdaVal[i] != 0)
+			{
+				// Sensor is valid, take highest (leanest) value for output
+				if (lambdaVal[i] > outputLambda)
+				{
+					outputLambda = lambdaVal[i]; // Take highest (leanest) value for output
+				}
+			}
+		}
+
+		SetN2kOutsideEnvironmentalParameters(N2kMsg, 1, N2kDoubleNA, N2kDoubleNA, outputLambda );
+		NMEA2000.SendMsg(N2kMsg);
+	}
+
+	if (cycle.isInterval(CI::_1000ms))
+	{
+		/*inline void SetN2kPGN127489(tN2kMsg &N2kMsg, unsigned char EngineInstance, double EngineOilPress, double EngineOilTemp, double EngineCoolantTemp, double AltenatorVoltage,
+                       double FuelRate, double EngineHours, double EngineCoolantPress=N2kDoubleNA, double EngineFuelPress=N2kDoubleNA,
+                       int8_t EngineLoad=N2kInt8NA, int8_t EngineTorque=N2kInt8NA,
+                       bool flagCheckEngine=false,       bool flagOverTemp=false,         bool flagLowOilPress=false,         bool flagLowOilLevel=false,
+                       bool flagLowFuelPress=false,      bool flagLowSystemVoltage=false, bool flagLowCoolantLevel=false,     bool flagWaterFlow=false,
+                       bool flagWaterInFuel=false,       bool flagChargeIndicator=false,  bool flagPreheatIndicator=false,    bool flagHighBoostPress=false,
+                       bool flagRevLimitExceeded=false,  bool flagEgrSystem=false,        bool flagTPS=false,                 bool flagEmergencyStopMode=false,
+                       bool flagWarning1=false,          bool flagWarning2=false,         bool flagPowerReduction=false,      bool flagMaintenanceNeeded=false,
+                       bool flagEngineCommError=false,   bool flagSubThrottle=false,      bool flagNeutralStartProtect=false, bool flagEngineShuttingDown=false) */
+
+		double EngineOilPress = Sensor::getOrZero(SensorType::OilPressure);
+		double EngineOilTemp = CToKelvin(Sensor::getOrZero(SensorType::AuxTemp1));
+		double EngineCoolantTemp = CToKelvin(Sensor::getOrZero(SensorType::Clt));
+		double AlternatorVoltage = Sensor::getOrZero(SensorType::BatteryVoltage);
+
+		double FuelRate = 0.0;
+		/*
+		 * Calculate current fuel rate
+		 * From Lua:
+		 * local gPerSecond= getOutput('fuelFlowRate') --g/s
+		 * local gPerHour=gPerSecond*3600
+		 * local FuelRate=gPerHour/720 -- l/h
+		 * local FuelRateRes = math.floor(FuelRate/0.1) --0.0001 m3/h
+		*/
+		float gPerSecond = engine->engineState.fuelConsumption.getConsumptionGramPerSecond();
+		float gPerHour = gPerSecond * 3600.0;
+		FuelRate = gPerHour / 720.0; // -- l/h
+
+		double EngineHours = 0.0;
+		double EngineCoolantPress = Sensor::getOrZero(SensorType::AuxLinear1);
+		float EngineFuelPress = Sensor::getOrZero(SensorType::AuxLinear2);
+
+		// warning(CUSTOM_ERR_CAN_CONFIGURATION, "canDashboardNMEA2000 fuel pressure %f", EngineFuelPress);
+
+        int8_t EngineLoad=N2kInt8NA;
+		int8_t EngineTorque=N2kInt8NA;
+
+		bool flagOverTemp = false;
+		bool flagLowOilPress = false;
+		bool flagLowFuelPress = false;
+		bool flagLowSystemVoltage = false;
+		bool flagWaterFlow = false;
+        bool flagCheckEngine = false;
+		bool flagLowOilLevel = false;
+		bool flagLowCoolantLevel = false;
+        bool flagWaterInFuel=false;
+		bool flagChargeIndicator=false;
+		bool flagPreheatIndicator=false;
+		bool flagHighBoostPress=false;
+        bool flagRevLimitExceeded=false;
+		bool flagEgrSystem=false;
+		bool flagTPS=false;
+		bool flagEmergencyStopMode=false;
+        bool flagWarning1= false;
+		bool flagWarning2=false;
+		bool flagPowerReduction=false;
+		bool flagMaintenanceNeeded=false;
+        bool flagEngineCommError=false;
+		bool flagSubThrottle=false;
+		bool flagNeutralStartProtect=false;
+		bool flagEngineShuttingDown=false;
+
+		float mapValue = Sensor::getOrZero(SensorType::Map);
+		float battVoltage = Sensor::getOrZero(SensorType::BatteryVoltage);
+
+		/* Check if MAP sensor is valid */
+		if ( (battVoltage > 7.0f) && /* ensure 5V sensor supply */
+		    ((mapValue == 0.0f) || (mapValue >= 101.0f))) /* MAP sensor is neither 0 (invalid) nor above 100 kPa atmospheric pressure */
+		{
+			flagEmergencyStopMode = true;
+		}
+
+		/* If engine is off a voltage below 11.7V will trigger a warning,
+		 * if engine is running, below 750 RPM a voltage threshold of 12.5V and above 13.0V is used */
+		float battVoltageThreshold = 11.7f;
+		static uint8_t debounceCounterBattVoltage = 0u;
+		if (Sensor::getOrZero(SensorType::Rpm) >= 750.0f)
+		{
+			battVoltageThreshold = 13.0f;
+		}
+		else if (Sensor::getOrZero(SensorType::Rpm) > 400.0f)
+		{
+			battVoltageThreshold = 12.5f;
+		}
+		flagLowSystemVoltage = (battVoltage < battVoltageThreshold) ? true : false;
+
+		/* debounce voltage errors for 5s because of trim pump or anchor winch drawing a lot of current */
+		if (true == flagLowSystemVoltage)
+		{
+			/* error is active - debounce it if present less then 5s */
+			if (debounceCounterBattVoltage < 5u)
+			{
+				debounceCounterBattVoltage++;
+				flagLowSystemVoltage = false;
+			}
+		}
+		else
+		{
+			/* No voltage error - reset debounce counter */
+			debounceCounterBattVoltage = 0u;
+		}
+
+		/* Check if motor is running */
+		if (Sensor::getOrZero(SensorType::Rpm) > 400.0f)
+		{
+			float oilPress = Sensor::getOrZero(SensorType::OilPressure);
+			float coolantTemp = Sensor::getOrZero(SensorType::Clt);
+			float fuelPress = Sensor::getOrZero(SensorType::AuxLinear2);
+			float oilTemp = Sensor::getOrZero(SensorType::AuxTemp1);
+
+			/* Check if water or oil temperature is too hot */
+			flagOverTemp =  ((oilTemp > 125.0f) || (coolantTemp > 77.0f)) ? true : false;
+
+			/* 285kPa is the normal fuel pressure under full load
+			 * set threshold to -0.1 Bar -> 275 kPa
+			 * decrement by inverse MAP (100 kPa - current MAP value) */
+		    flagLowFuelPress = (fuelPress < (275.0f - (100.0f - mapValue))) ? true : false;
+
+			/* Below 1000 RPM use a water pressure threshold of 15.0 kPa and above use 25.0 kPa */
+			float waterPressThreshold = 15.0f;
+			if (Sensor::getOrZero(SensorType::Rpm) >= 1000.0f)
+			{
+				waterPressThreshold = 25.0f;
+			}
+			flagWaterFlow = (Sensor::getOrZero(SensorType::AuxLinear1) < waterPressThreshold) ? true : false;
+
+			/* Oil pressure based on RPM. Measured values from log file:
+			 * At idle we have a minimum 180 kPa
+			 * above 750 RPM we have a minimum 240 kPa
+			 * above 1400 RPM we have a minimum 327 kPa
+			 * above 2250 RPM we have a minimum 375 kPa
+			 * we decrement these values with a margin of 50 kPa
+			 */
+			float oilPressThreshold = 150.0f;
+			if (Sensor::getOrZero(SensorType::Rpm) >= 2250.0f)
+			{
+				oilPressThreshold = 325.0f;
+			}
+			else if (Sensor::getOrZero(SensorType::Rpm) >= 1400.0f)
+			{
+				oilPressThreshold = 275.0f;
+			}
+			else if (Sensor::getOrZero(SensorType::Rpm) >= 750.0f)
+			{
+				oilPressThreshold = 190.0f;
+			}
+			flagLowOilPress = (oilPress < oilPressThreshold) ? true : false;
+
+		}
+
+		/* summarize critical errors */
+		// flagCheckEngine = (flagOverTemp || flagLowOilPress || flagLowFuelPress);
+		// this has higher prio and the root cause is not directly visible
+
+		/* Enable beeper in case of critical error */
+		setError((flagOverTemp || flagLowOilPress || flagLowFuelPress), (obd_code_e)1 /* OBD_Manifold_Absolute_Pressure_Circuit_Malfunction blinks 9 times */);
+
+		/* Set the TS warning as indicator */
+		flagWarning1 = engine->engineState.warnings.isWarningNow();
+
+		/* check if we can validate the TPS and pedal sensor for errors */
+		// static volatile float tps1prim = Sensor::getOrZero(SensorType::Tps1Primary);
+		// static volatile float tps1sec = Sensor::getOrZero(SensorType::Tps1Secondary);
+		// static volatile float pedalComb = Sensor::getOrZero(SensorType::AcceleratorPedal);
+		// static volatile float pedalPrim = Sensor::getOrZero(SensorType::Tps1Primary);
+		// static volatile float pedalSec = Sensor::getOrZero(SensorType::Tps1Secondary);
+		// flagTPS = true;
+
+		SetN2kPGN127489(N2kMsg,                    0 /* EngineInstance */,   (EngineOilPress*1000),   EngineOilTemp,
+		               EngineCoolantTemp,          AlternatorVoltage,        FuelRate,                EngineHours,
+                       (EngineCoolantPress*1000),  (EngineFuelPress*1000),   EngineLoad,              EngineTorque,
+                       flagCheckEngine,            flagOverTemp,             flagLowOilPress,         flagLowOilLevel,
+                       flagLowFuelPress,           flagLowSystemVoltage,     flagLowCoolantLevel,     flagWaterFlow,
+                       flagWaterInFuel,            flagChargeIndicator,      flagPreheatIndicator,    flagHighBoostPress,
+                       flagRevLimitExceeded,       flagEgrSystem,            flagTPS,                 flagEmergencyStopMode,
+                       flagWarning1,               flagWarning2,             flagPowerReduction,      flagMaintenanceNeeded,
+                       flagEngineCommError,        flagSubThrottle,          flagNeutralStartProtect, flagEngineShuttingDown);
+		NMEA2000.SendMsg(N2kMsg);
+
+
+        double IntakeAirTemp = CToKelvin(Sensor::getOrZero(SensorType::Iat));
+		SetN2kTransmissionParameters(N2kMsg, 0 /* EngineInstance */, N2kTG_Unknown /* TransmissionGear */,
+		                            N2kDoubleNA /* OilPressure */, IntakeAirTemp /* OilTemperature */); // use transmission oil temperature for IAT
+		NMEA2000.SendMsg(N2kMsg);
+	}
+
+	if (cycle.isInterval(CI::_50ms))
+	{
+		// {
+		// 	CanTxMessage msg(CanCategory::NBC, CAN_BMW_E46_SPEED);
+		// 	msg.setShortValue(10 * 8, 1);
+		// }
+
+		// {
+		// 	CanTxMessage msg(CanCategory::NBC, CAN_BMW_E46_RPM);
+		// 	msg.setShortValue((int)(Sensor::getOrZero(SensorType::Rpm) * 6.4), 2);
+		// }
+
+		// {
+		// 	CanTxMessage msg(CanCategory::NBC, CAN_BMW_E46_DME2);
+		// 	msg.setShortValue((int)((Sensor::getOrZero(SensorType::Clt) + 48.373) / 0.75), 1);
+		// }
+
+
+	// if (false == doOnce)
+	// {
+	// 	SetN2kEnvironmentalParameters(N2kMsg, 1, N2kts_MainCabinTemperature, ReadCabinTemp());
+	// 	NMEA2000.SendMsg(N2kMsg);
+	// 	doOnce = true;
+	// }
+	// static uint8_t counter = 0;
+	// if (counter > 10) // after start wait some time to avoid timeout? was just a test, i think not needed...
+	// {
+		NMEA2000.ParseMessages();
+	// }
+	// else counter++;
+	}
+
+	
+  }
+
+// #endif // EFI_CAN_SUPPORT
