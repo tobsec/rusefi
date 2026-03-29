@@ -17,10 +17,15 @@
 
 #include "malfunction_central.h"
 
-// NMEA2000
-#define USE_N2K_CAN USE_N2K_ESP32_CAN
-#include <NMEA2000_CAN.h>
+// NMEA2000 — include directly instead of NMEA2000_CAN.h which allocates
+// the singleton via operator new at file scope (Static Initialization
+// Order Fiasco). Static allocation avoids the heap call entirely.
+#include <NMEA2000.h>
 #include <N2kMessages.h>
+#include "NMEA2000_rusefi/NMEA2000_rusefi.h"
+
+static tNMEA2000_rusefi nmea2000Instance;
+tNMEA2000 &NMEA2000 = nmea2000Instance;
 
 const unsigned long TransmitMessages[] PROGMEM = {127488L, 127489L, 127493L, 130311L, 0};
 
