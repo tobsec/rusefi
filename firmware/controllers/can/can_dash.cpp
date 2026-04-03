@@ -1336,6 +1336,70 @@ void OnN2kOpen() {
 // Declared in NMEA2000_rusefi.cpp — gates the bump allocator
 extern bool nmea2000HeapActive;
 
+// Sync RTC from GPS time received via NMEA2000 PGN 126992 (System Time)
+class N2kGpsTimeHandler : public tNMEA2000::tMsgHandler {
+public:
+	N2kGpsTimeHandler(tNMEA2000 *nmea) : tMsgHandler(126992L, nmea) {}
+
+protected:
+	void HandleMsg(const tN2kMsg &N2kMsg) override {
+		unsigned char SID;
+		uint16_t daysSince1970;
+		double secondsSinceMidnight;
+		tN2kTimeSource timeSource;
+
+		if (!ParseN2kSystemTime(N2kMsg, SID, daysSince1970, secondsSinceMidnight, timeSource)) {
+			return;
+		}
+
+		/* Only sync from GPS or GLONASS sources */
+		if (timeSource > N2ktimes_GLONASS) {
+			return;
+		}
+
+		/* Rate limit: sync once per 10 seconds */
+		uint32_t now = millis();
+		if ((now - m_lastSync) < 10000u) {
+			return;
+		}
+		m_lastSync = now;
+
+		/* Convert days since 1970-01-01 to year/month/day */
+		int32_t days = daysSince1970;
+		int year = 1970;
+		while (true) {
+			bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+			int daysInYear = leap ? 366 : 365;
+			if (days < daysInYear) break;
+			days -= daysInYear;
+			year++;
+		}
+		static const int daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+		bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+		int month = 0;
+		while (month < 12) {
+			int dim = daysInMonth[month] + ((month == 1 && leap) ? 1 : 0);
+			if (days < dim) break;
+			days -= dim;
+			month++;
+		}
+
+		uint32_t secs = (uint32_t)secondsSinceMidnight;
+		efidatetime_t dt;
+		dt.year = year;
+		dt.month = month + 1;
+		dt.day = days + 1;
+		dt.hour = secs / 3600;
+		dt.minute = (secs % 3600) / 60;
+		dt.second = secs % 60;
+
+		setRtcDateTime(&dt);
+	}
+
+private:
+	uint32_t m_lastSync = 0;
+};
+
 #define NMEA_PERSISTENT_MAGIC 0x4E324B48u  // "N2KH"
 
 // NMEA2000 Dashboard
@@ -1380,6 +1444,10 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		NMEA2000.ExtendTransmitMessages(TransmitMessages);
 		NMEA2000.SetOnOpen(OnN2kOpen);
 		NMEA2000.Open();
+
+		/* Sync RTC from GPS time on the N2K bus */
+		static N2kGpsTimeHandler gpsTimeHandler(&NMEA2000);
+		NMEA2000.AttachMsgHandler(&gpsTimeHandler);
 
 		initDone = true;
 	}
