@@ -1343,13 +1343,16 @@ void canDashboardNMEA2000(CanCycle cycle) {
 
 	if (false == initDone)
 	{
+		// Enable NMEA2000 bump heap — kept active permanently because the
+		// library does lazy allocations at runtime (e.g. PGN sequence counters
+		// in GetSequenceCounter()), not only during Open().
 		nmea2000HeapActive = true;
 
-		NMEA2000.SetProductInformation("00000001",
-										100,
-										"rusEFI Eidothea",
-										"1.1.0.0 (2024-07-10)",
-										"1.0.0.0 (2023-04-01)"
+		NMEA2000.SetProductInformation("00000001",       // Manufacturer's Model serial code
+										100,               // Manufacturer's product code
+										"rusEFI Eidothea",  // Model ID (max 32 chars)
+										TS_SIGNATURE,       // SW version — same as TunerStudio signature
+										"Eidothea F4 v0.1"  // Model version — hardware revision
 										);
 		NMEA2000.SetDeviceInformation(112233, // Unique number
 										140,  // Device function: Engine
@@ -1363,7 +1366,6 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		NMEA2000.SetOnOpen(OnN2kOpen);
 		NMEA2000.Open();
 
-		nmea2000HeapActive = false;
 		initDone = true;
 	}
 
