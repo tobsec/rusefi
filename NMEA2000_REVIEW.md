@@ -162,3 +162,100 @@ Large binary that should likely be generated, not tracked in git.
 - `tobsec/NMEA2000` (branch `rusefi`) — fork of ttlappalainen/NMEA2000
 - `tobsec/NMEA2000_rusefi` (branch `rusefi`) — CAN driver adapter
 - `tobsec/libfirmware` (branch `NMEA2000`) — compiler/linker flag changes
+
+---
+
+## Verification Results
+
+### Level 1: Build Verification
+
+All builds pass with `-Werror` (no new warnings in NMEA2000 code).
+
+| Build | Result |
+|---|---|
+| Firmware (Proteus F4, group functions disabled) | PASS — 534KB text, 260KB BSS |
+| Firmware (Proteus F4, group functions enabled) | PASS — 542KB text, 260KB BSS (+7KB ROM) |
+| Firmware with ramdisk (full config gen + compile) | PASS — 644KB text (includes ~107KB compressed ini) |
+
+### Level 2: Static Analysis
+
+#### 2A — Heap allocation trace (actual sizes from DWARF debug info)
+
+The `tNMEA2000_rusefi` singleton (108 bytes) is statically allocated in BSS.
+All heap allocations happen during `Open()` at runtime:
+
+| # | Allocation | Count | Size each | Total | Heap pos after |
+|---|---|---|---|---|---|
+| 1 | `tInternalDevice[1]` | 1 | 352 | 352 | 352 |
+| 2 | `tCANSendFrame[40]` | 40 | 16 | 640 | 992 |
+| 3 | `tN2kCANMsg[5]` | 5 | 260 | 1300 | 2292 |
+| 4 | Group function handlers (6x) | 6 | 20 | 120 | 2412 |
+| | **Total** | | | **2412** | **of 8192 (29%)** |
+
+Result: **PASS** — heap usage well within budget.
+
+#### 2B — No remaining SIOF risk
+
+`NMEA2000_CAN.h` (which does `new` at file scope) is not included anywhere.
+`can_dash.cpp` uses `static tNMEA2000_rusefi nmea2000Instance` instead.
+No `operator new` calls occur at static initialization time.
+
+Result: **PASS**
+
+#### 2C — Sensor read consistency
+
+All `Sensor::getOrZero()` calls in `canDashboardNMEA2000()` use local
+variables read once at the top of each cycle block. The 100ms block reads
+RPM, MAP, Lambda1, Lambda2. The 1000ms block reads RPM, MAP, battery
+voltage, oil pressure, oil temp, coolant temp, water pressure, fuel
+pressure. Only IAT (line 1547) is read directly — acceptable since it's
+a standalone value not used in any threshold comparison.
+
+Result: **PASS**
+
+#### 2D — Flag logic edge cases
+
+| Boundary | Behavior | Correct? |
+|---|---|---|
+| RPM exactly 400.0 | Not "running" — no oil/temp/fuel checks, voltage threshold 11.7V | Yes |
+| RPM exactly 750.0 | Voltage threshold 13.0V, oil threshold 190 kPa | Yes |
+| MAP exactly 0.0 | Emergency stop triggers (sensor disconnected) | Yes |
+| MAP exactly 101.0 | Emergency stop triggers (above atmospheric) | Yes |
+| Battery exactly 7.0 | MAP check skipped (5V supply not reliable) | Yes |
+| Fuel pressure at high MAP | Threshold rises above nominal — academic only since MAP >= 101 triggers emergency stop first | N/A |
+| Voltage debounce counter | uint8, maxes at 5, never overflows | Yes |
+| Lambda >= 6.5536 | Clamped to 65535 before uint16 cast | Yes |
+
+Result: **PASS**
+
+### Level 4: Hardware Test Plan
+
+#### Startup and basic operation
+- [ ] Flash firmware via DFU, verify no hard fault at boot
+- [ ] USB mass storage shows TunerStudio ini file (ramdisk fix)
+- [ ] TunerStudio connects and loads config
+- [ ] Select `CAN_BUS_NBC_NMEA2K` dashboard type in TunerStudio
+
+#### NMEA2000 bus verification (CAN analyzer or chart plotter)
+- [ ] Device appears on N2K network (address claim, node 22)
+- [ ] Device info correct: "rusEFI Eidothea", function 140 (Engine), class 50 (Propulsion)
+- [ ] Group function queries work (PGN list request, device info request)
+- [ ] PGN 127488 at 100ms: RPM and boost pressure values match TunerStudio
+- [ ] PGN 127489 at 1000ms: oil pressure, temps, voltage, fuel rate correct
+- [ ] PGN 127493 at 1000ms: IAT value appears in transmission oil temp field
+- [ ] PGN 130311 at 100ms: lambda value in atmospheric pressure field
+- [ ] Raw CAN 0x180/0x181 on bus 1: lambda1/lambda2 values
+
+#### Diagnostic flag testing (engine running)
+- [ ] Low voltage: verify flag after 5s debounce, resets when voltage recovers
+- [ ] Overtemp: triggers if coolant > 77C or oil > 125C
+- [ ] Low oil pressure: verify RPM-dependent thresholds (150/190/275/325 kPa)
+- [ ] Low fuel pressure: verify MAP-compensated threshold
+- [ ] Low water flow: verify pressure threshold at idle (15 kPa) vs running (25 kPa)
+- [ ] MAP sensor fault: disconnect MAP sensor, verify emergency stop flag while engine off
+- [ ] Audible alarm triggers on critical faults (overtemp, low oil, low fuel pressure)
+- [ ] `flagWarning1` reflects TunerStudio warning state
+
+#### Heap monitoring (via debugger or UART)
+- [ ] After `NMEA2000.Open()` completes, verify `userHeap.used()` ~ 2412 bytes
+- [ ] No heap overflow after extended runtime (hours)
