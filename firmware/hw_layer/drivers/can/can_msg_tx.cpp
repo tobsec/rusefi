@@ -75,12 +75,9 @@ CanTxMessage::~CanTxMessage() {
 				m_frame.data8[6], m_frame.data8[7]);
 	}
 
-	osalDbgAssert((&m_frame != nullptr), "m_frame is null");
-
-	// if (device == s_devices[1]) __asm volatile("BKPT #0\n");
-
-	// 100 ms timeout
-	msg_t msg = canTransmitTimeout(device, CAN_ANY_MAILBOX, &m_frame, TIME_MS2I(10)); // rename for debugger -- give only 10ms timeout
+	// 10ms timeout — sufficient for 250kbps NMEA2000 bus with 3 TX mailboxes.
+	// Keeps CAN thread responsive; if bus can't send in 10ms, it's a bus fault.
+	msg_t msg = canTransmitTimeout(device, CAN_ANY_MAILBOX, &m_frame, TIME_MS2I(10));
 #if EFI_TUNER_STUDIO
 	if (msg == MSG_OK) {
 		engine->outputChannels.canWriteOk++;
