@@ -1459,7 +1459,11 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		float rpm = Sensor::getOrZero(SensorType::Rpm);
 		float mapValue = Sensor::getOrZero(SensorType::Map);
 
-		SetN2kPGN127488(N2kMsg, 0 /* EngineInstance */, rpm, mapValue);
+		/* The boost-pressure field encodes 100 Pa/LSB. Passing kPa as-is
+		 * quantises to 100 kPa steps. Multiply by 1000 to use the library's
+		 * full resolution; the gauge divides by 1000 on receive (same
+		 * convention as oil/coolant/fuel pressure in PGN 127489 below). */
+		SetN2kPGN127488(N2kMsg, 0 /* EngineInstance */, rpm, mapValue * 1000);
 		NMEA2000.SendMsg(N2kMsg);
 
 		/* Lambda — clamp to uint16 range to prevent overflow (#11) */
