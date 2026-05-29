@@ -12,6 +12,7 @@
 
 #include "rusefi_lua.h"
 #include "can_bench_test.h"
+#include "NMEA2000_rusefi/NMEA2000_rusefi.h"
 
 typedef float SCRIPT_TABLE_8x8_f32t_linear[SCRIPT_TABLE_8 * SCRIPT_TABLE_8];
 
@@ -199,6 +200,10 @@ void processCanRxMessage(const size_t busIndex, const CANRxFrame &frame, efitick
 		printPacket(busIndex, frame);
 	}
 
+	/* Feed NMEA2000 library with extended frames from bus 1 */
+	if (busIndex == 1 && frame.IDE == CAN_IDE_EXT) {
+		nmea2000EnqueueRxFrame(CAN_EID(frame), frame.DLC, frame.data8);
+	}
 
 	serviceCanSubscribers(frame, nowNt);
 

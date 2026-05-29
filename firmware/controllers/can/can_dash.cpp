@@ -17,12 +17,17 @@
 
 #include "malfunction_central.h"
 
-// NMEA2000
-#define USE_N2K_CAN USE_N2K_ESP32_CAN
-#include <NMEA2000_CAN.h>
+// NMEA2000 — include directly instead of NMEA2000_CAN.h which allocates
+// the singleton via operator new at file scope (Static Initialization
+// Order Fiasco). Static allocation avoids the heap call entirely.
+#include <NMEA2000.h>
 #include <N2kMessages.h>
+#include "NMEA2000_rusefi/NMEA2000_rusefi.h"
 
-const unsigned long TransmitMessages[] PROGMEM = {127488L, 127489L, 127493L, 130311L, 0};
+static tNMEA2000_rusefi nmea2000Instance;
+tNMEA2000 &NMEA2000 = nmea2000Instance;
+
+const unsigned long TransmitMessages[] PROGMEM = {127488L, 127489L, 127493L, 130311L, 130314L, 0};
 
 #include "rusefi_types.h"
 #include "rtc_helper.h"
@@ -1331,20 +1336,102 @@ void OnN2kOpen() {
 // Declared in NMEA2000_rusefi.cpp — gates the bump allocator
 extern bool nmea2000HeapActive;
 
+// Sync RTC from GPS time received via NMEA2000 PGN 126992 (System Time)
+class N2kGpsTimeHandler : public tNMEA2000::tMsgHandler {
+public:
+	N2kGpsTimeHandler(tNMEA2000 *nmea) : tMsgHandler(126992L, nmea) {}
+
+protected:
+	void HandleMsg(const tN2kMsg &N2kMsg) override {
+		unsigned char SID;
+		uint16_t daysSince1970;
+		double secondsSinceMidnight;
+		tN2kTimeSource timeSource;
+
+		if (!ParseN2kSystemTime(N2kMsg, SID, daysSince1970, secondsSinceMidnight, timeSource)) {
+			return;
+		}
+
+		/* Only sync from GPS or GLONASS sources */
+		if (timeSource > N2ktimes_GLONASS) {
+			return;
+		}
+
+		/* Rate limit: sync once per 10 seconds */
+		uint32_t now = millis();
+		if ((now - m_lastSync) < 10000u) {
+			return;
+		}
+		m_lastSync = now;
+
+		/* Convert days since 1970-01-01 to year/month/day */
+		int32_t days = daysSince1970;
+		int year = 1970;
+		while (true) {
+			bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+			int daysInYear = leap ? 366 : 365;
+			if (days < daysInYear) break;
+			days -= daysInYear;
+			year++;
+		}
+		static const int daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+		bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+		int month = 0;
+		while (month < 12) {
+			int dim = daysInMonth[month] + ((month == 1 && leap) ? 1 : 0);
+			if (days < dim) break;
+			days -= dim;
+			month++;
+		}
+
+		uint32_t secs = (uint32_t)secondsSinceMidnight;
+		efidatetime_t dt;
+		dt.year = year;
+		dt.month = month + 1;
+		dt.day = days + 1;
+		dt.hour = secs / 3600;
+		dt.minute = (secs % 3600) / 60;
+		dt.second = secs % 60;
+
+		setRtcDateTime(&dt);
+	}
+
+private:
+	uint32_t m_lastSync = 0;
+};
+
+#define NMEA_PERSISTENT_MAGIC 0x4E324B48u  // "N2KH"
+
 // NMEA2000 Dashboard
 void canDashboardNMEA2000(CanCycle cycle) {
 
 	static bool initDone = false;
 
+	/* Engine hours — stored in RTC backup registers (persist with VBAT coin cell) */
+	static uint32_t engineHoursSeconds = 0u;
+	static bool hoursLoaded = false;
+	static bool wasRunning = false;
+
+	if (false == hoursLoaded)
+	{
+		if (RTC->BKP0R == NMEA_PERSISTENT_MAGIC) {
+			engineHoursSeconds = RTC->BKP1R;
+		}
+		hoursLoaded = true;
+	}
+
 	if (false == initDone)
 	{
+		// Enable NMEA2000 bump heap — kept active permanently because the
+		// library does lazy allocations at runtime (e.g. PGN sequence counters
+		// in GetSequenceCounter()), not only during Open().
 		nmea2000HeapActive = true;
 
-		NMEA2000.SetProductInformation("00000001",
-										100,
-										"rusEFI Eidothea",
-										"1.1.0.0 (2024-07-10)",
-										"1.0.0.0 (2023-04-01)"
+		NMEA2000.SetProductInformation("00000001",       // Manufacturer's Model serial code
+										100,               // Manufacturer's product code
+										"rusEFI Eidothea",  // Model ID (max 32 chars)
+										TS_SIGNATURE,       // SW version — same as TunerStudio signature
+										"Eidothea F4 v0.1"  // Model version — hardware revision
 										);
 		NMEA2000.SetDeviceInformation(112233, // Unique number
 										140,  // Device function: Engine
@@ -1358,7 +1445,10 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		NMEA2000.SetOnOpen(OnN2kOpen);
 		NMEA2000.Open();
 
-		nmea2000HeapActive = false;
+		/* Sync RTC from GPS time on the N2K bus */
+		static N2kGpsTimeHandler gpsTimeHandler(&NMEA2000);
+		NMEA2000.AttachMsgHandler(&gpsTimeHandler);
+
 		initDone = true;
 	}
 
@@ -1369,7 +1459,11 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		float rpm = Sensor::getOrZero(SensorType::Rpm);
 		float mapValue = Sensor::getOrZero(SensorType::Map);
 
-		SetN2kPGN127488(N2kMsg, 0 /* EngineInstance */, rpm, mapValue);
+		/* The boost-pressure field encodes 100 Pa/LSB. Passing kPa as-is
+		 * quantises to 100 kPa steps. Multiply by 1000 to use the library's
+		 * full resolution; the gauge divides by 1000 on receive (same
+		 * convention as oil/coolant/fuel pressure in PGN 127489 below). */
+		SetN2kPGN127488(N2kMsg, 0 /* EngineInstance */, rpm, mapValue * 1000);
 		NMEA2000.SendMsg(N2kMsg);
 
 		/* Lambda — clamp to uint16 range to prevent overflow (#11) */
@@ -1429,7 +1523,7 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		float gPerSecond = engine->engineState.fuelConsumption.getConsumptionGramPerSecond();
 		double FuelRate = (gPerSecond * 3600.0) / 720.0;
 
-		double EngineHours = 0.0;
+		double EngineHours = static_cast<double>(engineHoursSeconds);
 		int8_t EngineLoad = N2kInt8NA;
 		int8_t EngineTorque = N2kInt8NA;
 
@@ -1493,9 +1587,18 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			debounceCounterBattVoltage = 0u;
 		}
 
-		/* Engine running diagnostics */
+		/* Engine running diagnostics + engine hours */
 		if (rpm > 400.0f)
 		{
+			wasRunning = true;
+			engineHoursSeconds++;
+
+			/* Save to RTC backup register every 60 seconds (cheap register write) */
+			if ((engineHoursSeconds % 60u) == 0u) {
+				RTC->BKP0R = NMEA_PERSISTENT_MAGIC;
+				RTC->BKP1R = engineHoursSeconds;
+			}
+
 			flagOverTemp = (oilTemp > 125.0f) || (coolantTemp > 77.0f);
 
 			/* Fuel pressure: 285 kPa nominal, -0.1 bar margin, MAP-compensated */
@@ -1521,6 +1624,13 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			}
 			flagLowOilPress = oilPress < oilPressThreshold;
 		}
+		else if (wasRunning)
+		{
+			/* Engine just stopped — save final engine hours to RTC backup register */
+			RTC->BKP0R = NMEA_PERSISTENT_MAGIC;
+			RTC->BKP1R = engineHoursSeconds;
+			wasRunning = false;
+		}
 
 		/* Trigger alarm on critical faults */
 		setError((flagOverTemp || flagLowOilPress || flagLowFuelPress), (obd_code_e)1);
@@ -1538,10 +1648,24 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		               flagEngineCommError,        flagSubThrottle,          flagNeutralStartProtect,  flagEngineShuttingDown);
 		NMEA2000.SendMsg(N2kMsg);
 
-		/* Send IAT as transmission oil temperature */
+		/* Send IAT as transmission oil temperature, lambda as gearbox oil pressure.
+		 * Lambda is scaled so 1.0 lambda = 1.0 Bar on the Raymarine display.
+		 * PGN 127493 OilPressure is in Pascals, so lambda 1.0 = 100000 Pa = 1.0 Bar. */
 		double IntakeAirTemp = CToKelvin(Sensor::getOrZero(SensorType::Iat));
-		SetN2kTransmissionParameters(N2kMsg, 0, N2kTG_Unknown, N2kDoubleNA, IntakeAirTemp);
+		float lambda1 = Sensor::getOrZero(SensorType::Lambda1);
+		float lambda2 = Sensor::getOrZero(SensorType::Lambda2);
+		float worstLambda = (lambda1 > lambda2) ? lambda1 : lambda2;
+		/* Scale x10 so lambda 0.85 = 8.5 Bar, lambda 1.00 = 10.0 Bar on Raymarine display */
+		double lambdaAsPressure = (worstLambda > 0.0f) ? (worstLambda * 1000000.0) : N2kDoubleNA;
+		SetN2kTransmissionParameters(N2kMsg, 0, N2kTG_Unknown, lambdaAsPressure, IntakeAirTemp);
 		NMEA2000.SendMsg(N2kMsg);
+
+		/* Barometric pressure via PGN 130314 (LPS25 I2C sensor, returns kPa) */
+		float baroKpa = Sensor::getOrZero(SensorType::BarometricPressure);
+		if (baroKpa > 0.0f) {
+			SetN2kPressure(N2kMsg, 0, 0, N2kps_Atmospheric, baroKpa * 1000.0);
+			NMEA2000.SendMsg(N2kMsg);
+		}
 	}
 
 	if (cycle.isInterval(CI::_50ms))
