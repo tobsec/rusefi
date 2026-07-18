@@ -1553,10 +1553,12 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		bool flagNeutralStartProtect = false;
 		bool flagEngineShuttingDown = false;
 
-		/* MAP sensor validity — check whenever 5V supply is present (battery > 7V).
-		 * Not gated behind RPM so operator sees sensor failure before starting. */
+		/* MAP sensor plausibility — check whenever 5V supply is present (battery > 7V).
+		 * Not gated behind RPM so operator sees sensor failure before starting.
+		 * NA engine: MAP reaches ~atmospheric (~101-102 kPa) at WOT, so only 0 (dead
+		 * sensor) or > 104 kPa (railed high; sensor full-scale ~115) is implausible. */
 		if (battVoltage > 7.0f &&
-		    (mapValue == 0.0f || mapValue >= 101.0f))
+		    (mapValue == 0.0f || mapValue > 104.0f))
 		{
 			flagEmergencyStopMode = true;
 		}

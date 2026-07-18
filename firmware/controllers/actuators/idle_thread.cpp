@@ -52,10 +52,13 @@ IIdleController::Phase IdleController::determinePhase(int rpm, int targetRpm, Se
 		return Phase::Running;
 	}
 
-	// If rpm too high (but throttle not pressed), we're coasting
+	// If rpm too high (but throttle not pressed), we're coasting — but NOT during the after-start
+	// taper (crankingTaperFraction < 1), otherwise the intentionally elevated post-start RPM is
+	// mis-classified as coasting and the coasting table fights the taper (idle RPM oscillation).
+	// Mirrors upstream determinePhase: `looksLikeCoasting && !looksLikeCrankToIdle`.
 	int maximumIdleRpm = targetRpm + engineConfiguration->idlePidRpmUpperLimit;
 	looksLikeCoasting = rpm > maximumIdleRpm;
-	if (looksLikeCoasting) {
+	if (looksLikeCoasting && crankingTaperFraction >= 1) {
 		return Phase::Coasting;
 	}
 
