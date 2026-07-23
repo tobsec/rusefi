@@ -1509,22 +1509,30 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		auto mapR = Sensor::get(SensorType::Map);
 		float mapValue = mapR.value_or(0.0f);
 		float battVoltage = Sensor::getOrZero(SensorType::BatteryVoltage);
-		/* Temps gate their over-temp warning on validity (an invalid temp cannot legitimately
-		 * claim "over-temp"). Pressures do NOT gate on validity: an invalid/absent-reading
-		 * pressure sensor is itself a genuine fault, so its low-pressure warning should latch
-		 * — achieved by getOrZero reading 0 plus a hasSensor gate below. */
-		auto oilTempR = Sensor::get(SensorType::AuxTemp1);
-		auto coolantR = Sensor::get(SensorType::Clt);
+		/* Temps gate their over-temp WARNING on validity (an invalid temp cannot claim
+		 * "over-temp"). Pressures do NOT gate their warning on validity: an invalid/absent
+		 * pressure sensor is itself a fault (value_or(0) reads 0 -> low-pressure latches).
+		 * The .Valid flags ARE used to send N2kDoubleNA on the display so the gauge shows "---"
+		 * instead of a real-looking 0. value_or(0) is bit-identical to getOrZero. */
+		auto oilTempR    = Sensor::get(SensorType::AuxTemp1);
+		auto coolantR    = Sensor::get(SensorType::Clt);
+		auto oilPressR   = Sensor::get(SensorType::OilPressure);
+		auto waterPressR = Sensor::get(SensorType::AuxLinear1);
+		auto fuelPressR  = Sensor::get(SensorType::AuxLinear2);
 		float oilTemp = oilTempR.value_or(0.0f);
 		float coolantTemp = coolantR.value_or(0.0f);
-		float oilPress = Sensor::getOrZero(SensorType::OilPressure);
-		float waterPress = Sensor::getOrZero(SensorType::AuxLinear1);
-		float fuelPress = Sensor::getOrZero(SensorType::AuxLinear2);
+		float oilPress = oilPressR.value_or(0.0f);
+		float waterPress = waterPressR.value_or(0.0f);
+		float fuelPress = fuelPressR.value_or(0.0f);
 
-		/* PGN 127489 values */
-		double EngineOilPress = oilPress;
-		double EngineOilTemp = CToKelvin(oilTemp);
-		double EngineCoolantTemp = CToKelvin(coolantTemp);
+		/* PGN 127489 values — send N2kDoubleNA for an invalid/absent sensor so the Raymarine
+		 * shows "---" rather than a real-looking 0 (same idiom as the lambda field below).
+		 * Pressures are pre-scaled to Pa here so the NA sentinel is never arithmetically mangled. */
+		double EngineOilPress    = oilPressR.Valid   ? (oilPress   * 1000.0) : N2kDoubleNA;
+		double WaterPressPa      = waterPressR.Valid ? (waterPress * 1000.0) : N2kDoubleNA;
+		double FuelPressPa       = fuelPressR.Valid  ? (fuelPress  * 1000.0) : N2kDoubleNA;
+		double EngineOilTemp = oilTempR.Valid ? CToKelvin(oilTemp) : N2kDoubleNA;
+		double EngineCoolantTemp = coolantR.Valid ? CToKelvin(coolantTemp) : N2kDoubleNA;
 		double AlternatorVoltage = battVoltage;
 
 		/* Fuel rate: g/s -> l/h (fuel density ~720 g/l) */
@@ -1654,7 +1662,7 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			 * where reduced pump flow lets the temp soak briefly after load. */
 			if (rpm > 1000.0f) { if (cltFlowSeconds < 60u) { cltFlowSeconds++; } }
 			else { cltFlowSeconds = 0u; }
-			float cltLimit = (cltFlowSeconds >= 30u) ? 77.0f : 80.0f;
+			float cltLimit = (cltFlowSeconds >= 30u) ? 78.0f : 80.0f;
 
 			/* Over-temp — oil and coolant get INDEPENDENT hysteresis+debounce latches, each
 			 * validity-gated (an invalid temp sensor cannot claim over-temp). Two separate
@@ -1669,11 +1677,11 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			 * CONFIGURED (hasSensor); the running + post-start grace is the outer if. Clear 15 s. */
 
 			/* Fuel pressure is manifold-referenced: trip = MAP + 170 (15 kPa below the log WOT
-			 * floor), compensating by MAP only while it is valid (else atmospheric 100 kPa).
-			 * ~1 s assert debounce rejects brief tip-in sags. */
-			float mapForFuel = mapR.Valid ? mapValue : 100.0f;
-			float fuelAssert = mapForFuel + 170.0f;
-			flagLowFuelPress = lowFuelWarn.updateLowGated(Sensor::hasSensor(SensorType::AuxLinear2),
+			 * floor). The threshold is meaningless without a valid MAP, so GATE the warning on
+			 * mapR.Valid — otherwise a MAP failure would apply the WOT-level threshold at idle
+			 * (where the rail legitimately runs lower) and false-trip. ~1 s assert debounce. */
+			float fuelAssert = mapValue + 170.0f;
+			flagLowFuelPress = lowFuelWarn.updateLowGated(Sensor::hasSensor(SensorType::AuxLinear2) && mapR.Valid,
 				fuelPress, fuelAssert, fuelAssert + 10.0f, 2, 15);
 
 			/* Water flow via pressure — rpm-scheduled trip (15/25 kPa), ±100 rpm hyst, +3 kPa
@@ -1688,9 +1696,12 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			flagLowOilPress = oilPressWarn.updateLowGated(Sensor::hasSensor(SensorType::OilPressure),
 				oilPress, oilAssert, oilAssert + 15.0f, 2, 15);
 		}
-		else
+		else if (!engine->rpmCalculator.isRunning())
 		{
-			/* Not running/settled — hold every latch clear so a start/stall/stop begins clean. */
+			/* Engine stopped — clear every latch so the next start begins clean. A mere in-run
+			 * gate dropout (post-start grace, or a transient rpm-signal dip to <=400 while still
+			 * running) deliberately does NOT reset here, so a genuine latched alarm stays sticky
+			 * against rpm noise instead of dropping for a cycle and re-debouncing. */
 			oilTempWarn.reset();
 			coolantTempWarn.reset();
 			lowFuelWarn.reset();
@@ -1716,9 +1727,9 @@ void canDashboardNMEA2000(CanCycle cycle) {
 
 		flagWarning1 = engine->engineState.warnings.isWarningNow();
 
-		SetN2kPGN127489(N2kMsg,                    0 /* EngineInstance */,   (EngineOilPress * 1000),  EngineOilTemp,
+		SetN2kPGN127489(N2kMsg,                    0 /* EngineInstance */,   EngineOilPress,           EngineOilTemp,
 		               EngineCoolantTemp,          AlternatorVoltage,        FuelRate,                 EngineHours,
-		               (waterPress * 1000),        (fuelPress * 1000),       EngineLoad,               EngineTorque,
+		               WaterPressPa,               FuelPressPa,              EngineLoad,               EngineTorque,
 		               flagCheckEngine,            flagOverTemp,             flagLowOilPress,          flagLowOilLevel,
 		               flagLowFuelPress,           flagLowSystemVoltage,     flagLowCoolantLevel,      flagWaterFlow,
 		               flagWaterInFuel,            flagChargeIndicator,      flagPreheatIndicator,     flagHighBoostPress,
