@@ -146,9 +146,19 @@ static obd_code_e getCodeForIgnition(int idx, brain_pin_diag_e diag) {
 void SensorChecker::onSlowCallback() {
 	// Don't check when the ignition is off, or when it was just turned on (let things stabilize)
 	// TODO: also inhibit checking if we just did a flash burn, since that blocks the ECU for a few seconds.
-	bool shouldCheck = m_ignitionIsOn && m_timeSinceIgnOff.hasElapsedSec(5);
+	// Suppress checks during / just after a low-battery brownout — analog readings are
+	// unreliable then and would raise phantom faults. (adapted from FOME)
+	if (Sensor::getOrZero(SensorType::BatteryVoltage) < 7.0f) {
+		m_timeSinceVbattLow.reset();
+	}
+
+	bool shouldCheck = m_ignitionIsOn
+		&& m_timeSinceIgnOff.hasElapsedSec(5)
+		&& m_timeSinceVbattLow.hasElapsedSec(5);
 	m_analogSensorsShouldWork = shouldCheck;
-	if (shouldCheck) {
+	// NOTE: the '!' restores the correct sense — this file had the inverted gate from
+	// rusEFI #4854; upstream rusEFI (#5232, commit 954da551) and FOME both carry the fix.
+	if (!shouldCheck) {
 		return;
 	}
 

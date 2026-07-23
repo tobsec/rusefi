@@ -13,6 +13,7 @@ public:
 private:
 	bool m_ignitionIsOn = false;
 	Timer m_timeSinceIgnOff;
+	Timer m_timeSinceVbattLow;   // brownout guard (adapted from FOME)
 
 	bool m_analogSensorsShouldWork = false;
 };
