@@ -147,8 +147,11 @@ void SensorChecker::onSlowCallback() {
 	// Don't check when the ignition is off, or when it was just turned on (let things stabilize)
 	// TODO: also inhibit checking if we just did a flash burn, since that blocks the ECU for a few seconds.
 	// Suppress checks during / just after a low-battery brownout — analog readings are
-	// unreliable then and would raise phantom faults. (adapted from FOME)
-	if (Sensor::getOrZero(SensorType::BatteryVoltage) < 7.0f) {
+	// unreliable then and would raise phantom faults. (adapted from FOME) Require a VALID
+	// low reading: getOrZero() returns 0 for an absent/faulted VBatt sensor, and 0 < 7 would
+	// otherwise reset the timer every cycle and permanently disable ALL analog checks.
+	auto vbatt = Sensor::get(SensorType::BatteryVoltage);
+	if (vbatt && vbatt.Value < 7.0f) {
 		m_timeSinceVbattLow.reset();
 	}
 

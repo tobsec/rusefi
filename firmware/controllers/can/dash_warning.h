@@ -65,14 +65,14 @@ private:
 	bool update(bool fault, bool recovered, int assertCount, int clearCount) {
 		if (!m_state) {
 			if (fault) {
-				if (m_counter < 255u) { m_counter++; }
+				if (m_counter < 65535u) { m_counter++; }
 				if (m_counter >= assertCount) { m_state = true; m_counter = 0u; }
 			} else {
 				m_counter = 0u;
 			}
 		} else {
 			if (recovered) {
-				if (m_counter < 255u) { m_counter++; }
+				if (m_counter < 65535u) { m_counter++; }
 				if (m_counter >= clearCount) { m_state = false; m_counter = 0u; }
 			} else {
 				m_counter = 0u;
@@ -81,8 +81,9 @@ private:
 		return m_state;
 	}
 
-	bool    m_state   = false;
-	uint8_t m_counter = 0u;
+	bool     m_state   = false;
+	uint16_t m_counter = 0u;   // consecutive-sample count; uint16 headroom (<=65535 == ~18 h @1Hz)
+	                           // so a large assert/clearCount can never silently saturate and fail.
 };
 
 /**

@@ -1619,10 +1619,11 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		static uint16_t cltFlowSeconds = 0u;
 
 		/* One common "engine running and settled" gate for all diagnostic warnings: the real
-		 * running-state (not a magic rpm>400) plus a post-start grace so pressures have built
-		 * and cranking/stall rpm spikes cannot raise a warning. */
+		 * running-state, an rpm floor, and a post-start grace. The rpm floor is required
+		 * because isRunning() stays true all the way down to rpm 0 during a shutdown decay or
+		 * near-stall — without it, genuine low oil pressure at 100-300 rpm would false-trip. */
 		float secondsRunning = engine->rpmCalculator.getSecondsSinceEngineStart(getTimeNowNt());
-		bool engineRunningSettled = engine->rpmCalculator.isRunning() && (secondsRunning > 3.0f);
+		bool engineRunningSettled = engine->rpmCalculator.isRunning() && (rpm > 400.0f) && (secondsRunning > 3.0f);
 
 		/* Engine hours: count whenever the engine turns (rpm > 400), independent of the
 		 * warning gate so no time is lost during the post-start grace. */
