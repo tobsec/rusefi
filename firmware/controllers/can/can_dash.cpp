@@ -1337,42 +1337,64 @@ void OnN2kOpen() {
 // Declared in NMEA2000_rusefi.cpp — gates the bump allocator
 extern bool nmea2000HeapActive;
 
-// Sync RTC from GPS time received via NMEA2000 PGN 126992 (System Time)
+// Sync RTC from GPS time on the N2K bus. Wildcard handler (PGN 0 = every received message) so
+// we catch whichever date/time carrier the GPS/chartplotter actually broadcasts: PGN 126992
+// (System Time — optional, many units never send it), 129029 (GNSS Position Data — the reliable
+// one, sent at 1 Hz by every GPS source), or 129033 (Date/Time). Previously only 126992 was
+// handled, which is why the sync silently never fired on a bus that only carries 129029.
 class N2kGpsTimeHandler : public tNMEA2000::tMsgHandler {
 public:
-	N2kGpsTimeHandler(tNMEA2000 *nmea) : tMsgHandler(126992L, nmea) {}
+	N2kGpsTimeHandler(tNMEA2000 *nmea) : tMsgHandler(0, nmea) {}
 
 protected:
 	void HandleMsg(const tN2kMsg &N2kMsg) override {
-		unsigned char SID;
-		uint16_t daysSince1970;
-		double secondsSinceMidnight;
-		tN2kTimeSource timeSource;
+		uint16_t days = 0u;
+		double secs = 0.0;
 
-		if (!ParseN2kSystemTime(N2kMsg, SID, daysSince1970, secondsSinceMidnight, timeSource)) {
-			return;
+		switch (N2kMsg.PGN) {
+			case 126992L: {   // System Time (single frame)
+				unsigned char SID;
+				tN2kTimeSource src;
+				if (!ParseN2kSystemTime(N2kMsg, SID, days, secs, src)) { return; }
+				break;        // no source filter — accept any source, plausibility-checked below
+			}
+			case 129029L: {   // GNSS Position Data (fast packet) — days/secs are fields 2/3
+				unsigned char SID, nSat, nRef;
+				double lat, lon, alt, hdop, pdop, geo, age;
+				tN2kGNSStype gt, rt;
+				tN2kGNSSmethod gm;
+				uint16_t rid;
+				if (!ParseN2kGNSS(N2kMsg, SID, days, secs, lat, lon, alt, gt, gm,
+						nSat, hdop, pdop, geo, nRef, rt, rid, age)) { return; }
+				break;
+			}
+			case 129033L: {   // Date, Time & Local Offset (single frame)
+				int16_t localOffset;
+				if (!ParseN2kPGN129033(N2kMsg, days, secs, localOffset)) { return; }
+				break;
+			}
+			default:
+				return;
 		}
 
-		/* Only sync from GPS or GLONASS sources */
-		if (timeSource > N2ktimes_GLONASS) {
-			return;
-		}
+		/* Plausibility instead of a source filter: reject NA/garbage dates.
+		 * day 18993 ~ 2022-01-01, day 47482 ~ 2100-01-01. */
+		if (days < 18993u || days > 47482u) { return; }
+		if (secs < 0.0 || secs >= 86400.0) { return; }
 
-		/* Rate limit: sync once per 10 seconds */
+		/* Rate limit once per 10 s, but let the FIRST valid message sync immediately. */
 		uint32_t now = millis();
-		if ((now - m_lastSync) < 10000u) {
-			return;
-		}
+		if (m_lastSync != 0u && (now - m_lastSync) < 10000u) { return; }
 		m_lastSync = now;
 
 		/* Convert days since 1970-01-01 to year/month/day */
-		int32_t days = daysSince1970;
+		int32_t d = days;
 		int year = 1970;
 		while (true) {
 			bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
 			int daysInYear = leap ? 366 : 365;
-			if (days < daysInYear) break;
-			days -= daysInYear;
+			if (d < daysInYear) break;
+			d -= daysInYear;
 			year++;
 		}
 		static const int daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
@@ -1380,25 +1402,25 @@ protected:
 		int month = 0;
 		while (month < 12) {
 			int dim = daysInMonth[month] + ((month == 1 && leap) ? 1 : 0);
-			if (days < dim) break;
-			days -= dim;
+			if (d < dim) break;
+			d -= dim;
 			month++;
 		}
 
-		uint32_t secs = (uint32_t)secondsSinceMidnight;
+		uint32_t s = (uint32_t)secs;
 		efidatetime_t dt;
 		dt.year = year;
 		dt.month = month + 1;
-		dt.day = days + 1;
-		dt.hour = secs / 3600;
-		dt.minute = (secs % 3600) / 60;
-		dt.second = secs % 60;
+		dt.day = d + 1;
+		dt.hour = s / 3600;
+		dt.minute = (s % 3600) / 60;
+		dt.second = s % 60;
 
 		setRtcDateTime(&dt);
 	}
 
 private:
-	uint32_t m_lastSync = 0;
+	uint32_t m_lastSync = 0u;
 };
 
 #define NMEA_PERSISTENT_MAGIC 0x4E324B48u  // "N2KH"
@@ -1440,6 +1462,8 @@ void canDashboardNMEA2000(CanCycle cycle) {
 										2040  // Manufacturer code
 									);
 
+		/* Headroom for reassembling the 129029 GNSS fast-packet (~7 frames); must precede Open(). */
+		NMEA2000.SetN2kCANMsgBufSize(8);
 		NMEA2000.SetMode(tNMEA2000::N2km_NodeOnly, 22);
 		NMEA2000.EnableForward(false);
 		NMEA2000.ExtendTransmitMessages(TransmitMessages);
