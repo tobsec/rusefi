@@ -49,6 +49,57 @@ TEST(idle_v2, timingPid) {
 	EXPECT_FLOAT_EQ(-5,   dut.getIdleTimingAdjustment(1050, 1000, ICP::Idling));
 }
 
+// The idle timing PID takes its D-term from the clean per-engine-cycle RPM rate
+// (getRpmAcceleration) instead of differentiating the noisy instantRpm. Verify the D-term
+// math: dTerm = dFactor * (-rpmRate), P stays on instantRpm, and P+D clamp together.
+TEST(idle_v2, timingPidCleanDTerm) {
+	EngineTestHelper eth(TEST_ENGINE);
+	IdleController dut;
+
+	engineConfiguration->useIdleTimingPidControl = true;
+	engineConfiguration->idleTimingPid.pFactor = 0.1;
+	engineConfiguration->idleTimingPid.dFactor = 0.01;	// degrees per (rpm/s)
+	engineConfiguration->idleTimingPid.minValue = -10;
+	engineConfiguration->idleTimingPid.maxValue = 10;
+	dut.init();
+
+	// Pure D: on target (error = 0), engine accelerating (+200 rpm/s) -> pull timing to damp.
+	engine->rpmCalculator.rpmRate = 200;
+	EXPECT_FLOAT_EQ(-2.0, dut.getIdleTimingAdjustment(1000, 1000, ICP::Idling));	// 0.01 * -200
+
+	// Engine decelerating (-200 rpm/s) -> add timing.
+	engine->rpmCalculator.rpmRate = -200;
+	EXPECT_FLOAT_EQ(2.0, dut.getIdleTimingAdjustment(1000, 1000, ICP::Idling));	// 0.01 * +200
+
+	// Combined P + D: 50 rpm below target (P = +5) while accelerating +100 rpm/s (D = -1) -> +4.
+	engine->rpmCalculator.rpmRate = 100;
+	EXPECT_FLOAT_EQ(4.0, dut.getIdleTimingAdjustment(950, 1000, ICP::Idling));	// 0.1*50 + 0.01*-100
+
+	// A large rate must clamp to maxValue, never run away.
+	engine->rpmCalculator.rpmRate = -100000;
+	EXPECT_FLOAT_EQ(10, dut.getIdleTimingAdjustment(1000, 1000, ICP::Idling));
+}
+
+// Regression guard: with dFactor == 0 the controller is byte-identical to the previous
+// P-only behavior - the (possibly noisy) RPM rate must have zero effect on the output.
+TEST(idle_v2, timingPidNoiseImmuneWhenNoDTerm) {
+	EngineTestHelper eth(TEST_ENGINE);
+	IdleController dut;
+
+	engineConfiguration->useIdleTimingPidControl = true;
+	engineConfiguration->idleTimingPid.pFactor = 0.1;
+	engineConfiguration->idleTimingPid.dFactor = 0;
+	engineConfiguration->idleTimingPid.minValue = -10;
+	engineConfiguration->idleTimingPid.maxValue = 10;
+	dut.init();
+
+	// Even a huge rpmRate leaves the P-only output untouched when there is no D-term.
+	engine->rpmCalculator.rpmRate = 5000;
+	EXPECT_FLOAT_EQ(-5, dut.getIdleTimingAdjustment(1050, 1000, ICP::Idling));
+	engine->rpmCalculator.rpmRate = -5000;
+	EXPECT_FLOAT_EQ(-5, dut.getIdleTimingAdjustment(1050, 1000, ICP::Idling));
+}
+
 TEST(idle_v2, testTargetRpm) {
 	EngineTestHelper eth(TEST_ENGINE);
 	IdleController dut;

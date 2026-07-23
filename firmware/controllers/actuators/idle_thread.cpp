@@ -174,7 +174,21 @@ float IdleController::getIdleTimingAdjustment(int rpm, int targetRpm, Phase phas
 	}
 
 	// We're now in the idle mode, and RPM is inside the Timing-PID regulator work zone!
-	return m_timingPid.getOutput(targetRpm, rpm, FAST_CALLBACK_PERIOD_MS / 1000.0f);
+	//
+	// 58x codewheel note: the base Pid formed its D-term by differentiating instantRpm
+	// (dFactor/dt * delta-instantRpm). With a high tooth count instantRpm carries a lot of
+	// per-tooth measurement noise, and differentiating it turned that noise into idle-timing
+	// chatter -> a self-excited limit cycle after a load step (gear engagement). Keep P on
+	// instantRpm (fast sag rejection is unchanged), but source the D-term from the clean
+	// per-engine-cycle RPM rate (getRpmAcceleration) instead of differentiating instantRpm.
+	// idleTimingPid has no I-term, so we form this small P+D controller explicitly here.
+	// With dFactor == 0 this is byte-identical to the previous P-only behavior
+	// (guarded by test idle_v2.timingPidNoiseImmuneWhenNoDTerm).
+	const auto& cfg = engineConfiguration->idleTimingPid;
+	float pTerm = cfg.pFactor * (targetRpm - rpm);
+	// d(error)/dt = d(targetRpm - rpm)/dt = -rpmRate   (target ~ constant at idle)
+	float dTerm = cfg.dFactor * -engine->rpmCalculator.getRpmAcceleration();
+	return clampF(cfg.minValue, pTerm + dTerm + cfg.offset, cfg.maxValue);
 }
 
 static void finishIdleTestIfNeeded() {
