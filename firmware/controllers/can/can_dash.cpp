@@ -1489,6 +1489,18 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			msg[1] = (uint8_t)(lambdaVal[1u] & 0xFF);
 		}
 
+		{
+			/* Target (commanded) lambda — 0x182, byte-identical encoding to the measured
+			 * banks 0x180/0x181 (raw = lambda / 0.0001, big-endian uint16 in bytes 0..1) so
+			 * the gauge decodes all three with one decoder. Source: fuelComputer.targetLambda
+			 * (the same value already sent on the AiM frame). */
+			uint16_t targetVal = (uint16_t)clampF(0, (float)engine->fuelComputer.targetLambda / 0.0001f, 65535);
+			CanTxMessage msg(CanCategory::NBC, 0x182);
+			msg.busIndex = 1;
+			msg[0] = (uint8_t)(targetVal >> 8);
+			msg[1] = (uint8_t)(targetVal & 0xFF);
+		}
+
 		/* Take highest (leanest) valid lambda for N2K output */
 		for (uint8_t i = 0u; i < 2u; i++)
 		{
