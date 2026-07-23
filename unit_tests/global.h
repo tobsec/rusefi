@@ -47,6 +47,11 @@ void chDbgAssert(int c, char *msg, void *arg);
 
 #define chDbgCheck(x, y) chDbgAssert(x, y, NULL)
 
+// Host stub for the ChibiOS OSAL assert (firmware pulls this from osal.h; the unit-test
+// build has no OSAL layer). Needed so fork modules that use osalDbgAssert (e.g. NMEA2000)
+// compile in the host build.
+#define osalDbgAssert(c, remark) chDbgAssert((c), (char*)(remark), NULL)
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
