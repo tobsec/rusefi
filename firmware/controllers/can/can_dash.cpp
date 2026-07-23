@@ -1606,17 +1606,26 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		static DashWarning waterFlowWarn;
 		static DashWarning oilPressWarn;
 		static SteppedThreshold<1> waterFlowSched;   // boundary 1000 rpm
-		static SteppedThreshold<3> oilPressSched;    // boundaries 750/1400/2250 rpm
+		static SteppedThreshold<6> oilPressSched;    // boundaries 750/1400/2250/2900/3700/4400 rpm
 		static const float waterBounds[1] = { 1000.0f };
 		static const float waterLevels[2] = {   15.0f, 25.0f };
-		static const float oilBounds[3]   = { 750.0f, 1400.0f, 2250.0f };
-		static const float oilLevels[4]   = { 150.0f, 190.0f,  275.0f, 325.0f };
+		/* Oil-pressure trip per rpm band, from the log-measured healthy hot floor (re_86-90 +
+		 * re_76 hot case) minus a small margin — as low as safely possible. */
+		static const float oilBounds[6]   = { 750.0f, 1400.0f, 2250.0f, 2900.0f, 3700.0f, 4400.0f };
+		static const float oilLevels[7]   = { 140.0f, 145.0f,  275.0f,  320.0f,  335.0f,  345.0f,  365.0f };
 
-		/* Post-start grace: pressure warnings stay clear until the engine has run a few
-		 * seconds (oil/fuel/water pressure is still building right after start). */
+		/* Seconds of continuous rpm > 1000 (good coolant flow) — selects the tight vs
+		 * heat-soak CLT limit below. */
+		static uint16_t cltFlowSeconds = 0u;
+
+		/* One common "engine running and settled" gate for all diagnostic warnings: the real
+		 * running-state (not a magic rpm>400) plus a post-start grace so pressures have built
+		 * and cranking/stall rpm spikes cannot raise a warning. */
 		float secondsRunning = engine->rpmCalculator.getSecondsSinceEngineStart(getTimeNowNt());
+		bool engineRunningSettled = engine->rpmCalculator.isRunning() && (secondsRunning > 3.0f);
 
-		/* Engine running diagnostics + engine hours */
+		/* Engine hours: count whenever the engine turns (rpm > 400), independent of the
+		 * warning gate so no time is lost during the post-start grace. */
 		if (rpm > 400.0f)
 		{
 			wasRunning = true;
@@ -1627,40 +1636,6 @@ void canDashboardNMEA2000(CanCycle cycle) {
 				RTC->BKP0R = NMEA_PERSISTENT_MAGIC;
 				RTC->BKP1R = engineHoursSeconds;
 			}
-
-			/* Over-temp — oil and coolant get INDEPENDENT hysteresis+debounce latches, each
-			 * validity-gated (an invalid temp sensor cannot claim over-temp). Two separate
-			 * statements so both latches advance every cycle (no short-circuit ||). Trip
-			 * levels unchanged; clear 3 K lower; assert 2 s, clear 15 s (long enough to read). */
-			bool oilOverTemp     = oilTempWarn.updateHighGated(oilTempR.Valid, oilTemp,     125.0f, 122.0f, 2, 15);
-			bool coolantOverTemp = coolantTempWarn.updateHighGated(coolantR.Valid, coolantTemp, 77.0f, 74.0f, 2, 15);
-			flagOverTemp = oilOverTemp || coolantOverTemp;
-
-			/* Pressure faults: a low reading OR an invalid/absent-reading sensor (getOrZero
-			 * -> 0) is a genuine fault and latches the warning. Gated only on the sensor being
-			 * CONFIGURED (hasSensor) plus the post-start grace (pressure is still building) —
-			 * NOT on validity, so a dead sensor stays flagged. Clear 15 s (long enough to read). */
-			bool pressGrace = secondsRunning > 3.0f;
-
-			/* Fuel pressure is manifold-referenced: trip = 175 + MAP, compensating by MAP only
-			 * while it is valid (else fall back to atmospheric 100 kPa). Assert immediately. */
-			float mapForFuel = mapR.Valid ? mapValue : 100.0f;
-			float fuelAssert = 275.0f - (100.0f - mapForFuel);
-			flagLowFuelPress = lowFuelWarn.updateLowGated(Sensor::hasSensor(SensorType::AuxLinear2) && pressGrace,
-				fuelPress, fuelAssert, fuelAssert + 10.0f, 1, 15);
-
-			/* Water flow via pressure — rpm-scheduled trip (15/25 kPa), ±100 rpm hyst, +3 kPa
-			 * clear. DEBOUNCED assert (3 s), unlike oil/fuel: brief flow dips (weed/air/wave)
-			 * are not a real loss. */
-			float waterAssert = waterFlowSched.get(rpm, waterBounds, waterLevels, 100.0f);
-			flagWaterFlow = waterFlowWarn.updateLowGated(Sensor::hasSensor(SensorType::AuxLinear1) && pressGrace,
-				waterPress, waterAssert, waterAssert + 3.0f, 3, 15);
-
-			/* Oil pressure — rpm-scheduled trip (150/190/275/325 kPa), ±150 rpm hyst, +15 kPa
-			 * clear. Assert immediately (a real oil-pressure loss must not wait). */
-			float oilAssert = oilPressSched.get(rpm, oilBounds, oilLevels, 150.0f);
-			flagLowOilPress = oilPressWarn.updateLowGated(Sensor::hasSensor(SensorType::OilPressure) && pressGrace,
-				oilPress, oilAssert, oilAssert + 15.0f, 1, 15);
 		}
 		else if (wasRunning)
 		{
@@ -1668,8 +1643,53 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			RTC->BKP0R = NMEA_PERSISTENT_MAGIC;
 			RTC->BKP1R = engineHoursSeconds;
 			wasRunning = false;
+		}
 
-			/* Clear warning latches so the next start begins clean. */
+		/* Diagnostic warnings — all gated on the common "running and settled" predicate. */
+		if (engineRunningSettled)
+		{
+			/* CLT over-temp is situation-dependent: a TIGHT limit (77 C) once coolant flow is
+			 * good (rpm > 1000 for >= 30 s), relaxed to a heat-soak limit (80 C) at low rpm
+			 * where reduced pump flow lets the temp soak briefly after load. */
+			if (rpm > 1000.0f) { if (cltFlowSeconds < 60u) { cltFlowSeconds++; } }
+			else { cltFlowSeconds = 0u; }
+			float cltLimit = (cltFlowSeconds >= 30u) ? 77.0f : 80.0f;
+
+			/* Over-temp — oil and coolant get INDEPENDENT hysteresis+debounce latches, each
+			 * validity-gated (an invalid temp sensor cannot claim over-temp). Two separate
+			 * statements so both latches advance every cycle. Clear 3 K lower; assert 2 s,
+			 * clear 15 s (long enough to read). */
+			bool oilOverTemp     = oilTempWarn.updateHighGated(oilTempR.Valid, oilTemp, 105.0f, 102.0f, 2, 15);
+			bool coolantOverTemp = coolantTempWarn.updateHighGated(coolantR.Valid, coolantTemp, cltLimit, cltLimit - 3.0f, 2, 15);
+			flagOverTemp = oilOverTemp || coolantOverTemp;
+
+			/* Pressure faults: a low reading OR an invalid/absent-reading sensor (getOrZero
+			 * -> 0) is a genuine fault and latches the warning. Gated only on the sensor being
+			 * CONFIGURED (hasSensor); the running + post-start grace is the outer if. Clear 15 s. */
+
+			/* Fuel pressure is manifold-referenced: trip = MAP + 170 (15 kPa below the log WOT
+			 * floor), compensating by MAP only while it is valid (else atmospheric 100 kPa).
+			 * ~1 s assert debounce rejects brief tip-in sags. */
+			float mapForFuel = mapR.Valid ? mapValue : 100.0f;
+			float fuelAssert = mapForFuel + 170.0f;
+			flagLowFuelPress = lowFuelWarn.updateLowGated(Sensor::hasSensor(SensorType::AuxLinear2),
+				fuelPress, fuelAssert, fuelAssert + 10.0f, 2, 15);
+
+			/* Water flow via pressure — rpm-scheduled trip (15/25 kPa), ±100 rpm hyst, +3 kPa
+			 * clear. 3 s assert debounce (brief flow dips are not a real loss). */
+			float waterAssert = waterFlowSched.get(rpm, waterBounds, waterLevels, 100.0f);
+			flagWaterFlow = waterFlowWarn.updateLowGated(Sensor::hasSensor(SensorType::AuxLinear1),
+				waterPress, waterAssert, waterAssert + 3.0f, 3, 15);
+
+			/* Oil pressure — log-derived rpm-scheduled trip, ±100 rpm hyst, +15 kPa clear.
+			 * ~1 s assert debounce filters the idle-oscillation slosh dips (<= 374 ms). */
+			float oilAssert = oilPressSched.get(rpm, oilBounds, oilLevels, 100.0f);
+			flagLowOilPress = oilPressWarn.updateLowGated(Sensor::hasSensor(SensorType::OilPressure),
+				oilPress, oilAssert, oilAssert + 15.0f, 2, 15);
+		}
+		else
+		{
+			/* Not running/settled — hold every latch clear so a start/stall/stop begins clean. */
 			oilTempWarn.reset();
 			coolantTempWarn.reset();
 			lowFuelWarn.reset();
@@ -1677,6 +1697,7 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			oilPressWarn.reset();
 			oilPressSched.reset();
 			waterFlowSched.reset();
+			cltFlowSeconds = 0u;
 		}
 
 		/* Rev limiter status — same expression as can_verbose.cpp:42. */
