@@ -44,6 +44,11 @@ CPPSRC += $(ALLCPPSRC) \
 	$(RUSEFI_LIB_CPP) \
 	$(RUSEFI_LIB_CPP_TEST) \
 
+# NMEA2000_rusefi.cpp is a ChibiOS/hardware CAN glue module (osalDbgAssert, TIME_I2MS,
+# chVTGetSystemTime, ...) that does not compile in the host unit-test build. Exclude it
+# from the unit-test source set only; the firmware build is unaffected.
+CPPSRC := $(filter-out %NMEA2000_rusefi.cpp,$(CPPSRC))
+
 INCDIR += \
 	$(PCH_DIR) \
 	$(UNIT_TESTS_DIR) \

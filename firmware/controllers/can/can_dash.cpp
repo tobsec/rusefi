@@ -16,6 +16,7 @@
 #include "can_vag.h"
 
 #include "malfunction_central.h"
+#include "dash_warning.h"
 
 // NMEA2000 — include directly instead of NMEA2000_CAN.h which allocates
 // the singleton via operator new at file scope (Static Initialization
@@ -1336,42 +1337,64 @@ void OnN2kOpen() {
 // Declared in NMEA2000_rusefi.cpp — gates the bump allocator
 extern bool nmea2000HeapActive;
 
-// Sync RTC from GPS time received via NMEA2000 PGN 126992 (System Time)
+// Sync RTC from GPS time on the N2K bus. Wildcard handler (PGN 0 = every received message) so
+// we catch whichever date/time carrier the GPS/chartplotter actually broadcasts: PGN 126992
+// (System Time — optional, many units never send it), 129029 (GNSS Position Data — the reliable
+// one, sent at 1 Hz by every GPS source), or 129033 (Date/Time). Previously only 126992 was
+// handled, which is why the sync silently never fired on a bus that only carries 129029.
 class N2kGpsTimeHandler : public tNMEA2000::tMsgHandler {
 public:
-	N2kGpsTimeHandler(tNMEA2000 *nmea) : tMsgHandler(126992L, nmea) {}
+	N2kGpsTimeHandler(tNMEA2000 *nmea) : tMsgHandler(0, nmea) {}
 
 protected:
 	void HandleMsg(const tN2kMsg &N2kMsg) override {
-		unsigned char SID;
-		uint16_t daysSince1970;
-		double secondsSinceMidnight;
-		tN2kTimeSource timeSource;
+		uint16_t days = 0u;
+		double secs = 0.0;
 
-		if (!ParseN2kSystemTime(N2kMsg, SID, daysSince1970, secondsSinceMidnight, timeSource)) {
-			return;
+		switch (N2kMsg.PGN) {
+			case 126992L: {   // System Time (single frame)
+				unsigned char SID;
+				tN2kTimeSource src;
+				if (!ParseN2kSystemTime(N2kMsg, SID, days, secs, src)) { return; }
+				break;        // no source filter — accept any source, plausibility-checked below
+			}
+			case 129029L: {   // GNSS Position Data (fast packet) — days/secs are fields 2/3
+				unsigned char SID, nSat, nRef;
+				double lat, lon, alt, hdop, pdop, geo, age;
+				tN2kGNSStype gt, rt;
+				tN2kGNSSmethod gm;
+				uint16_t rid;
+				if (!ParseN2kGNSS(N2kMsg, SID, days, secs, lat, lon, alt, gt, gm,
+						nSat, hdop, pdop, geo, nRef, rt, rid, age)) { return; }
+				break;
+			}
+			case 129033L: {   // Date, Time & Local Offset (single frame)
+				int16_t localOffset;
+				if (!ParseN2kPGN129033(N2kMsg, days, secs, localOffset)) { return; }
+				break;
+			}
+			default:
+				return;
 		}
 
-		/* Only sync from GPS or GLONASS sources */
-		if (timeSource > N2ktimes_GLONASS) {
-			return;
-		}
+		/* Plausibility instead of a source filter: reject NA/garbage dates.
+		 * day 18993 ~ 2022-01-01, day 47482 ~ 2100-01-01. */
+		if (days < 18993u || days > 47482u) { return; }
+		if (secs < 0.0 || secs >= 86400.0) { return; }
 
-		/* Rate limit: sync once per 10 seconds */
+		/* Rate limit once per 10 s, but let the FIRST valid message sync immediately. */
 		uint32_t now = millis();
-		if ((now - m_lastSync) < 10000u) {
-			return;
-		}
+		if (m_lastSync != 0u && (now - m_lastSync) < 10000u) { return; }
 		m_lastSync = now;
 
 		/* Convert days since 1970-01-01 to year/month/day */
-		int32_t days = daysSince1970;
+		int32_t d = days;
 		int year = 1970;
 		while (true) {
 			bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
 			int daysInYear = leap ? 366 : 365;
-			if (days < daysInYear) break;
-			days -= daysInYear;
+			if (d < daysInYear) break;
+			d -= daysInYear;
 			year++;
 		}
 		static const int daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
@@ -1379,25 +1402,25 @@ protected:
 		int month = 0;
 		while (month < 12) {
 			int dim = daysInMonth[month] + ((month == 1 && leap) ? 1 : 0);
-			if (days < dim) break;
-			days -= dim;
+			if (d < dim) break;
+			d -= dim;
 			month++;
 		}
 
-		uint32_t secs = (uint32_t)secondsSinceMidnight;
+		uint32_t s = (uint32_t)secs;
 		efidatetime_t dt;
 		dt.year = year;
 		dt.month = month + 1;
-		dt.day = days + 1;
-		dt.hour = secs / 3600;
-		dt.minute = (secs % 3600) / 60;
-		dt.second = secs % 60;
+		dt.day = d + 1;
+		dt.hour = s / 3600;
+		dt.minute = (s % 3600) / 60;
+		dt.second = s % 60;
 
 		setRtcDateTime(&dt);
 	}
 
 private:
-	uint32_t m_lastSync = 0;
+	uint32_t m_lastSync = 0u;
 };
 
 #define NMEA_PERSISTENT_MAGIC 0x4E324B48u  // "N2KH"
@@ -1407,15 +1430,21 @@ void canDashboardNMEA2000(CanCycle cycle) {
 
 	static bool initDone = false;
 
-	/* Engine hours — stored in RTC backup registers (persist with VBAT coin cell) */
+	/* Engine hours — stored in RTC backup registers (persist with VBAT coin cell).
+	 * MUST use BKP2R/BKP3R: BKP0R/BKP1R are already owned by rusEFI's backup_ram.cpp
+	 * (BKP0R bit0-15 = IAC stepper position, bit16-23 = prime-injection ignition-switch
+	 * counter; BKP1R = CJ125 calibration). PrimeController rewrites BKP0R on every ignition-on
+	 * BEFORE this loads, so a magic in BKP0R would be corrupted (hours never persist) and our
+	 * full-word write would in turn wipe the stepper/prime state. BKP2R/BKP3R are unreferenced
+	 * tree-wide (BKP4R = DFU). */
 	static uint32_t engineHoursSeconds = 0u;
 	static bool hoursLoaded = false;
 	static bool wasRunning = false;
 
 	if (false == hoursLoaded)
 	{
-		if (RTC->BKP0R == NMEA_PERSISTENT_MAGIC) {
-			engineHoursSeconds = RTC->BKP1R;
+		if (RTC->BKP2R == NMEA_PERSISTENT_MAGIC) {
+			engineHoursSeconds = RTC->BKP3R;
 		}
 		hoursLoaded = true;
 	}
@@ -1439,6 +1468,8 @@ void canDashboardNMEA2000(CanCycle cycle) {
 										2040  // Manufacturer code
 									);
 
+		/* Headroom for reassembling the 129029 GNSS fast-packet (~7 frames); must precede Open(). */
+		NMEA2000.SetN2kCANMsgBufSize(8);
 		NMEA2000.SetMode(tNMEA2000::N2km_NodeOnly, 22);
 		NMEA2000.EnableForward(false);
 		NMEA2000.ExtendTransmitMessages(TransmitMessages);
@@ -1459,7 +1490,11 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		float rpm = Sensor::getOrZero(SensorType::Rpm);
 		float mapValue = Sensor::getOrZero(SensorType::Map);
 
-		SetN2kPGN127488(N2kMsg, 0 /* EngineInstance */, rpm, mapValue);
+		/* The boost-pressure field encodes 100 Pa/LSB. Passing kPa as-is
+		 * quantises to 100 kPa steps. Multiply by 1000 to use the library's
+		 * full resolution; the gauge divides by 1000 on receive (same
+		 * convention as oil/coolant/fuel pressure in PGN 127489 below). */
+		SetN2kPGN127488(N2kMsg, 0 /* EngineInstance */, rpm, mapValue * 1000);
 		NMEA2000.SendMsg(N2kMsg);
 
 		/* Lambda — clamp to uint16 range to prevent overflow (#11) */
@@ -1484,6 +1519,18 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			msg[1] = (uint8_t)(lambdaVal[1u] & 0xFF);
 		}
 
+		{
+			/* Target (commanded) lambda — 0x182, byte-identical encoding to the measured
+			 * banks 0x180/0x181 (raw = lambda / 0.0001, big-endian uint16 in bytes 0..1) so
+			 * the gauge decodes all three with one decoder. Source: fuelComputer.targetLambda
+			 * (the same value already sent on the AiM frame). */
+			uint16_t targetVal = (uint16_t)clampF(0, (float)engine->fuelComputer.targetLambda / 0.0001f, 65535);
+			CanTxMessage msg(CanCategory::NBC, 0x182);
+			msg.busIndex = 1;
+			msg[0] = (uint8_t)(targetVal >> 8);
+			msg[1] = (uint8_t)(targetVal & 0xFF);
+		}
+
 		/* Take highest (leanest) valid lambda for N2K output */
 		for (uint8_t i = 0u; i < 2u; i++)
 		{
@@ -1501,18 +1548,33 @@ void canDashboardNMEA2000(CanCycle cycle) {
 	{
 		/* Read all sensors once for consistent threshold evaluation (#10) */
 		float rpm = Sensor::getOrZero(SensorType::Rpm);
-		float mapValue = Sensor::getOrZero(SensorType::Map);
+		auto mapR = Sensor::get(SensorType::Map);
+		float mapValue = mapR.value_or(0.0f);
 		float battVoltage = Sensor::getOrZero(SensorType::BatteryVoltage);
-		float oilPress = Sensor::getOrZero(SensorType::OilPressure);
-		float oilTemp = Sensor::getOrZero(SensorType::AuxTemp1);
-		float coolantTemp = Sensor::getOrZero(SensorType::Clt);
-		float waterPress = Sensor::getOrZero(SensorType::AuxLinear1);
-		float fuelPress = Sensor::getOrZero(SensorType::AuxLinear2);
+		/* Temps gate their over-temp WARNING on validity (an invalid temp cannot claim
+		 * "over-temp"). Pressures do NOT gate their warning on validity: an invalid/absent
+		 * pressure sensor is itself a fault (value_or(0) reads 0 -> low-pressure latches).
+		 * The .Valid flags ARE used to send N2kDoubleNA on the display so the gauge shows "---"
+		 * instead of a real-looking 0. value_or(0) is bit-identical to getOrZero. */
+		auto oilTempR    = Sensor::get(SensorType::AuxTemp1);
+		auto coolantR    = Sensor::get(SensorType::Clt);
+		auto oilPressR   = Sensor::get(SensorType::OilPressure);
+		auto waterPressR = Sensor::get(SensorType::AuxLinear1);
+		auto fuelPressR  = Sensor::get(SensorType::AuxLinear2);
+		float oilTemp = oilTempR.value_or(0.0f);
+		float coolantTemp = coolantR.value_or(0.0f);
+		float oilPress = oilPressR.value_or(0.0f);
+		float waterPress = waterPressR.value_or(0.0f);
+		float fuelPress = fuelPressR.value_or(0.0f);
 
-		/* PGN 127489 values */
-		double EngineOilPress = oilPress;
-		double EngineOilTemp = CToKelvin(oilTemp);
-		double EngineCoolantTemp = CToKelvin(coolantTemp);
+		/* PGN 127489 values — send N2kDoubleNA for an invalid/absent sensor so the Raymarine
+		 * shows "---" rather than a real-looking 0 (same idiom as the lambda field below).
+		 * Pressures are pre-scaled to Pa here so the NA sentinel is never arithmetically mangled. */
+		double EngineOilPress    = oilPressR.Valid   ? (oilPress   * 1000.0) : N2kDoubleNA;
+		double WaterPressPa      = waterPressR.Valid ? (waterPress * 1000.0) : N2kDoubleNA;
+		double FuelPressPa       = fuelPressR.Valid  ? (fuelPress  * 1000.0) : N2kDoubleNA;
+		double EngineOilTemp = oilTempR.Valid ? CToKelvin(oilTemp) : N2kDoubleNA;
+		double EngineCoolantTemp = coolantR.Valid ? CToKelvin(coolantTemp) : N2kDoubleNA;
 		double AlternatorVoltage = battVoltage;
 
 		/* Fuel rate: g/s -> l/h (fuel density ~720 g/l) */
@@ -1549,10 +1611,12 @@ void canDashboardNMEA2000(CanCycle cycle) {
 		bool flagNeutralStartProtect = false;
 		bool flagEngineShuttingDown = false;
 
-		/* MAP sensor validity — check whenever 5V supply is present (battery > 7V).
-		 * Not gated behind RPM so operator sees sensor failure before starting. */
+		/* MAP sensor plausibility — check whenever 5V supply is present (battery > 7V).
+		 * Not gated behind RPM so operator sees sensor failure before starting.
+		 * NA engine: MAP reaches ~atmospheric (~101-102 kPa) at WOT, so only 0 (dead
+		 * sensor) or > 104 kPa (railed high; sensor full-scale ~115) is implausible. */
 		if (battVoltage > 7.0f &&
-		    (mapValue == 0.0f || mapValue >= 101.0f))
+		    (mapValue == 0.0f || mapValue > 104.0f))
 		{
 			flagEmergencyStopMode = true;
 		}
@@ -1583,7 +1647,36 @@ void canDashboardNMEA2000(CanCycle cycle) {
 			debounceCounterBattVoltage = 0u;
 		}
 
-		/* Engine running diagnostics + engine hours */
+		/* Debounced-hysteresis latches for the safety-warning flags. Static: they persist
+		 * across 1 Hz cycles; safe because this dashboard runs in one CAN-task context (same
+		 * pattern as debounceCounterBattVoltage above). See dash_warning.h. */
+		static DashWarning oilTempWarn;
+		static DashWarning coolantTempWarn;
+		static DashWarning lowFuelWarn;
+		static DashWarning waterFlowWarn;
+		static DashWarning oilPressWarn;
+		static SteppedThreshold<1> waterFlowSched;   // boundary 1000 rpm
+		static SteppedThreshold<6> oilPressSched;    // boundaries 750/1400/2250/2900/3700/4400 rpm
+		static const float waterBounds[1] = { 1000.0f };
+		static const float waterLevels[2] = {   15.0f, 25.0f };
+		/* Oil-pressure trip per rpm band, from the log-measured healthy hot floor (re_86-90 +
+		 * re_76 hot case) minus a small margin — as low as safely possible. */
+		static const float oilBounds[6]   = { 750.0f, 1400.0f, 2250.0f, 2900.0f, 3700.0f, 4400.0f };
+		static const float oilLevels[7]   = { 140.0f, 145.0f,  275.0f,  320.0f,  335.0f,  345.0f,  365.0f };
+
+		/* Seconds of continuous rpm > 1000 (good coolant flow) — selects the tight vs
+		 * heat-soak CLT limit below. */
+		static uint16_t cltFlowSeconds = 0u;
+
+		/* One common "engine running and settled" gate for all diagnostic warnings: the real
+		 * running-state, an rpm floor, and a post-start grace. The rpm floor is required
+		 * because isRunning() stays true all the way down to rpm 0 during a shutdown decay or
+		 * near-stall — without it, genuine low oil pressure at 100-300 rpm would false-trip. */
+		float secondsRunning = engine->rpmCalculator.getSecondsSinceEngineStart(getTimeNowNt());
+		bool engineRunningSettled = engine->rpmCalculator.isRunning() && (rpm > 400.0f) && (secondsRunning > 3.0f);
+
+		/* Engine hours: count whenever the engine turns (rpm > 400), independent of the
+		 * warning gate so no time is lost during the post-start grace. */
 		if (rpm > 400.0f)
 		{
 			wasRunning = true;
@@ -1591,51 +1684,94 @@ void canDashboardNMEA2000(CanCycle cycle) {
 
 			/* Save to RTC backup register every 60 seconds (cheap register write) */
 			if ((engineHoursSeconds % 60u) == 0u) {
-				RTC->BKP0R = NMEA_PERSISTENT_MAGIC;
-				RTC->BKP1R = engineHoursSeconds;
+				RTC->BKP2R = NMEA_PERSISTENT_MAGIC;
+				RTC->BKP3R = engineHoursSeconds;
 			}
-
-			flagOverTemp = (oilTemp > 125.0f) || (coolantTemp > 77.0f);
-
-			/* Fuel pressure: 285 kPa nominal, -0.1 bar margin, MAP-compensated */
-			flagLowFuelPress = fuelPress < (275.0f - (100.0f - mapValue));
-
-			/* Water flow via pressure sensor */
-			float waterPressThreshold = (rpm >= 1000.0f) ? 25.0f : 15.0f;
-			flagWaterFlow = waterPress < waterPressThreshold;
-
-			/* Oil pressure — RPM-based thresholds from measured log data with ~50 kPa margin */
-			float oilPressThreshold = 150.0f;
-			if (rpm >= 2250.0f)
-			{
-				oilPressThreshold = 325.0f;
-			}
-			else if (rpm >= 1400.0f)
-			{
-				oilPressThreshold = 275.0f;
-			}
-			else if (rpm >= 750.0f)
-			{
-				oilPressThreshold = 190.0f;
-			}
-			flagLowOilPress = oilPress < oilPressThreshold;
 		}
 		else if (wasRunning)
 		{
 			/* Engine just stopped — save final engine hours to RTC backup register */
-			RTC->BKP0R = NMEA_PERSISTENT_MAGIC;
-			RTC->BKP1R = engineHoursSeconds;
+			RTC->BKP2R = NMEA_PERSISTENT_MAGIC;
+			RTC->BKP3R = engineHoursSeconds;
 			wasRunning = false;
 		}
+
+		/* Diagnostic warnings — all gated on the common "running and settled" predicate. */
+		if (engineRunningSettled)
+		{
+			/* CLT over-temp is situation-dependent: a TIGHT limit (77 C) once coolant flow is
+			 * good (rpm > 1000 for >= 30 s), relaxed to a heat-soak limit (80 C) at low rpm
+			 * where reduced pump flow lets the temp soak briefly after load. */
+			if (rpm > 1000.0f) { if (cltFlowSeconds < 60u) { cltFlowSeconds++; } }
+			else { cltFlowSeconds = 0u; }
+			float cltLimit = (cltFlowSeconds >= 30u) ? 78.0f : 80.0f;
+
+			/* Over-temp — oil and coolant get INDEPENDENT hysteresis+debounce latches, each
+			 * validity-gated (an invalid temp sensor cannot claim over-temp). Two separate
+			 * statements so both latches advance every cycle. Clear 3 K lower; assert 2 s,
+			 * clear 15 s (long enough to read). */
+			bool oilOverTemp     = oilTempWarn.updateHighGated(oilTempR.Valid, oilTemp, 105.0f, 102.0f, 2, 15);
+			bool coolantOverTemp = coolantTempWarn.updateHighGated(coolantR.Valid, coolantTemp, cltLimit, cltLimit - 3.0f, 2, 15);
+			flagOverTemp = oilOverTemp || coolantOverTemp;
+
+			/* Pressure faults: a low reading OR an invalid/absent-reading sensor (getOrZero
+			 * -> 0) is a genuine fault and latches the warning. Gated only on the sensor being
+			 * CONFIGURED (hasSensor); the running + post-start grace is the outer if. Clear 15 s. */
+
+			/* Fuel pressure is manifold-referenced: trip = MAP + 170 (15 kPa below the log WOT
+			 * floor). The threshold is meaningless without a valid MAP, so GATE the warning on
+			 * mapR.Valid — otherwise a MAP failure would apply the WOT-level threshold at idle
+			 * (where the rail legitimately runs lower) and false-trip. ~1 s assert debounce. */
+			float fuelAssert = mapValue + 170.0f;
+			flagLowFuelPress = lowFuelWarn.updateLowGated(Sensor::hasSensor(SensorType::AuxLinear2) && mapR.Valid,
+				fuelPress, fuelAssert, fuelAssert + 10.0f, 2, 15);
+
+			/* Water flow via pressure — rpm-scheduled trip (15/25 kPa), ±100 rpm hyst, +3 kPa
+			 * clear. 3 s assert debounce (brief flow dips are not a real loss). */
+			float waterAssert = waterFlowSched.get(rpm, waterBounds, waterLevels, 100.0f);
+			flagWaterFlow = waterFlowWarn.updateLowGated(Sensor::hasSensor(SensorType::AuxLinear1),
+				waterPress, waterAssert, waterAssert + 3.0f, 3, 15);
+
+			/* Oil pressure — log-derived rpm-scheduled trip, ±100 rpm hyst, +15 kPa clear.
+			 * ~1 s assert debounce filters the idle-oscillation slosh dips (<= 374 ms). */
+			float oilAssert = oilPressSched.get(rpm, oilBounds, oilLevels, 100.0f);
+			flagLowOilPress = oilPressWarn.updateLowGated(Sensor::hasSensor(SensorType::OilPressure),
+				oilPress, oilAssert, oilAssert + 15.0f, 2, 15);
+		}
+		else if (!engine->rpmCalculator.isRunning())
+		{
+			/* Engine stopped — clear every latch so the next start begins clean. A mere in-run
+			 * gate dropout (post-start grace, or a transient rpm-signal dip to <=400 while still
+			 * running) deliberately does NOT reset here, so a genuine latched alarm stays sticky
+			 * against rpm noise instead of dropping for a cycle and re-debouncing. */
+			oilTempWarn.reset();
+			coolantTempWarn.reset();
+			lowFuelWarn.reset();
+			waterFlowWarn.reset();
+			oilPressWarn.reset();
+			oilPressSched.reset();
+			waterFlowSched.reset();
+			cltFlowSeconds = 0u;
+		}
+
+		/* Rev limiter status — same expression as can_verbose.cpp:42. */
+		flagRevLimitExceeded = rpm > engineConfiguration->rpmHardLimit;
 
 		/* Trigger alarm on critical faults */
 		setError((flagOverTemp || flagLowOilPress || flagLowFuelPress), (obd_code_e)1);
 
+		/* MIL / check-engine on the NMEA wire: true when any OBD code is latched — including
+		 * the critical-fault code (obd 1) just set above. hasErrorCodes() is itself
+		 * event-latched (not a per-cycle comparator) so it does not chatter and needs no
+		 * debounce. This is the wire bit only; the physical LS12 MIL pin is driven separately
+		 * by MILController from the same error store. */
+		flagCheckEngine = hasErrorCodes();
+
 		flagWarning1 = engine->engineState.warnings.isWarningNow();
 
-		SetN2kPGN127489(N2kMsg,                    0 /* EngineInstance */,   (EngineOilPress * 1000),  EngineOilTemp,
+		SetN2kPGN127489(N2kMsg,                    0 /* EngineInstance */,   EngineOilPress,           EngineOilTemp,
 		               EngineCoolantTemp,          AlternatorVoltage,        FuelRate,                 EngineHours,
-		               (waterPress * 1000),        (fuelPress * 1000),       EngineLoad,               EngineTorque,
+		               WaterPressPa,               FuelPressPa,              EngineLoad,               EngineTorque,
 		               flagCheckEngine,            flagOverTemp,             flagLowOilPress,          flagLowOilLevel,
 		               flagLowFuelPress,           flagLowSystemVoltage,     flagLowCoolantLevel,      flagWaterFlow,
 		               flagWaterInFuel,            flagChargeIndicator,      flagPreheatIndicator,     flagHighBoostPress,
