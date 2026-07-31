@@ -1430,15 +1430,21 @@ void canDashboardNMEA2000(CanCycle cycle) {
 
 	static bool initDone = false;
 
-	/* Engine hours — stored in RTC backup registers (persist with VBAT coin cell) */
+	/* Engine hours — stored in RTC backup registers (persist with VBAT coin cell).
+	 * MUST use BKP2R/BKP3R: BKP0R/BKP1R are already owned by rusEFI's backup_ram.cpp
+	 * (BKP0R bit0-15 = IAC stepper position, bit16-23 = prime-injection ignition-switch
+	 * counter; BKP1R = CJ125 calibration). PrimeController rewrites BKP0R on every ignition-on
+	 * BEFORE this loads, so a magic in BKP0R would be corrupted (hours never persist) and our
+	 * full-word write would in turn wipe the stepper/prime state. BKP2R/BKP3R are unreferenced
+	 * tree-wide (BKP4R = DFU). */
 	static uint32_t engineHoursSeconds = 0u;
 	static bool hoursLoaded = false;
 	static bool wasRunning = false;
 
 	if (false == hoursLoaded)
 	{
-		if (RTC->BKP0R == NMEA_PERSISTENT_MAGIC) {
-			engineHoursSeconds = RTC->BKP1R;
+		if (RTC->BKP2R == NMEA_PERSISTENT_MAGIC) {
+			engineHoursSeconds = RTC->BKP3R;
 		}
 		hoursLoaded = true;
 	}
@@ -1678,15 +1684,15 @@ void canDashboardNMEA2000(CanCycle cycle) {
 
 			/* Save to RTC backup register every 60 seconds (cheap register write) */
 			if ((engineHoursSeconds % 60u) == 0u) {
-				RTC->BKP0R = NMEA_PERSISTENT_MAGIC;
-				RTC->BKP1R = engineHoursSeconds;
+				RTC->BKP2R = NMEA_PERSISTENT_MAGIC;
+				RTC->BKP3R = engineHoursSeconds;
 			}
 		}
 		else if (wasRunning)
 		{
 			/* Engine just stopped — save final engine hours to RTC backup register */
-			RTC->BKP0R = NMEA_PERSISTENT_MAGIC;
-			RTC->BKP1R = engineHoursSeconds;
+			RTC->BKP2R = NMEA_PERSISTENT_MAGIC;
+			RTC->BKP3R = engineHoursSeconds;
 			wasRunning = false;
 		}
 
